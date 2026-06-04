@@ -196,7 +196,7 @@ export class MultiBackend {
 			videoRenderer.close();
 		});
 
-		// Audio download follows the emitter's enable policy (paused/muted).
+		// Audio download follows the emitter's enable policy (paused; muted keeps downloading).
 		effect.proxy(this.#audioEnabled, audioEmitter.output.enabled);
 
 		// Video download policy: when playing, follow visibility; when paused, fetch a

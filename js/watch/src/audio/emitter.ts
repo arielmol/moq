@@ -6,10 +6,12 @@ const FADE_TIME = 0.2;
 
 type EmitterInput = {
 	volume: Getter<number>;
+
+	// Silences the speakers but keeps the stream flowing. The decoder still runs the
+	// audio graph, so visualizations keep working and unmuting is instant.
 	muted: Getter<boolean>;
 
-	// Similar to muted, but controls whether we download audio at all.
-	// That way we can be "muted" but also download audio for visualizations.
+	// Stops downloading audio entirely. Unlike `muted`, this disables the decoder.
 	paused: Getter<boolean>;
 };
 
@@ -39,12 +41,13 @@ export class Emitter {
 		this.input = {
 			volume: getter(props?.volume ?? 0.5),
 			muted: getter(props?.muted ?? false),
-			paused: getter(props?.paused ?? props?.muted ?? false),
+			paused: getter(props?.paused ?? false),
 		};
 
+		// Download whenever not paused. Muting only disconnects the speakers below, so a
+		// muted stream keeps flowing to the audio graph for visualizations.
 		this.#signals.run((effect) => {
-			const enabled = !effect.get(this.input.paused) && !effect.get(this.input.muted);
-			this.#output.enabled.set(enabled);
+			this.#output.enabled.set(!effect.get(this.input.paused));
 		});
 
 		this.#signals.run((effect) => {
@@ -57,10 +60,11 @@ export class Emitter {
 			effect.set(this.#gain, gain);
 
 			effect.run((inner) => {
-				// We only connect/disconnect when enabled to save power.
-				// Otherwise the worklet keeps running in the background returning 0s.
+				// Connect to the speakers only while downloading and not muted; disconnect
+				// otherwise to save power. The worklet keeps running either way, returning 0s.
 				const enabled = inner.get(this.#output.enabled);
-				if (!enabled) return;
+				const muted = inner.get(this.input.muted);
+				if (!enabled || muted) return;
 
 				gain.connect(root.context.destination); // speakers
 				inner.cleanup(() => gain.disconnect());
