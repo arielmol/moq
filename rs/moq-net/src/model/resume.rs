@@ -59,7 +59,10 @@ fn slice(prefs: &Subscription, start: Option<u64>, end: Option<u64>) -> Subscrip
 	sub.group_start = match (prefs.group_start, start) {
 		(Some(a), Some(b)) => Some(a.max(b)),
 		(Some(a), None) => Some(a),
-		(None, bound) => bound,
+		// No explicit start means the live edge. A takeover boundary is range
+		// bookkeeping, not a request: turning it into demand would replay the
+		// whole outage to a subscriber that asked for the latest group.
+		(None, _) => None,
 	};
 	sub.group_end = min_some(prefs.group_end, end);
 	sub
@@ -1789,6 +1792,35 @@ mod test {
 
 		// The replacement must inherit live-edge demand, not a full backfill.
 		assert_eq!(track_b.subscription().unwrap().group_start, None);
+	}
+
+	#[tokio::test]
+	async fn takeover_after_produced_segment_keeps_live_edge() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (mut track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer.consume().subscribe(None);
+		recv_pending(&mut sub);
+		assert_eq!(track_a.subscription().unwrap().group_start, None);
+
+		// A produced groups before its route died; B takes over.
+		write_group(&mut track_a, 0, "a0");
+		write_group(&mut track_a, 1, "a1");
+		assert_eq!(recv(&mut sub), 0);
+		assert_eq!(recv(&mut sub), 1);
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// The takeover boundary bounds the segment range, not the demand: a
+		// live-edge subscriber must not be turned into a backfill of the outage.
+		assert_eq!(track_b.subscription().unwrap().group_start, None);
+
+		// Groups at the live edge still arrive past the boundary.
+		write_group(&mut track_b, 5, "b5");
+		assert_eq!(recv(&mut sub), 5);
 	}
 
 	#[tokio::test]
