@@ -59,10 +59,15 @@ fn slice(prefs: &Subscription, start: Option<u64>, end: Option<u64>) -> Subscrip
 	sub.group_start = match (prefs.group_start, start) {
 		(Some(a), Some(b)) => Some(a.max(b)),
 		(Some(a), None) => Some(a),
-		// No explicit start means the live edge. A takeover boundary is range
-		// bookkeeping, not a request: turning it into demand would replay the
-		// whole outage to a subscriber that asked for the latest group.
-		(None, _) => None,
+		// No start plus a zero latency budget means the live edge: the boundary
+		// is range bookkeeping. A latency window is the opt-in to backfill.
+		(None, bound) => {
+			if prefs.latency_max.is_zero() {
+				None
+			} else {
+				bound
+			}
+		}
 	};
 	sub.group_end = min_some(prefs.group_end, end);
 	sub
@@ -1821,6 +1826,28 @@ mod test {
 		// Groups at the live edge still arrive past the boundary.
 		write_group(&mut track_b, 5, "b5");
 		assert_eq!(recv(&mut sub), 5);
+	}
+
+	#[tokio::test]
+	async fn takeover_backfills_a_subscriber_with_a_latency_window() {
+		let (mut track_a, consumer_a) = track_pair("a");
+		let (track_b, consumer_b) = track_pair("b");
+
+		let mut producer = Producer::new();
+		producer.takeover(&consumer_a).unwrap();
+		let mut sub = producer
+			.consume()
+			.subscribe(Subscription::default().with_latency_max(std::time::Duration::from_secs(10)));
+		recv_pending(&mut sub);
+
+		write_group(&mut track_a, 0, "a0");
+		assert_eq!(recv(&mut sub), 0);
+		drop(track_a);
+		producer.takeover(&consumer_b).unwrap();
+		recv_pending(&mut sub);
+
+		// A latency window opts into history: the demand resumes at the boundary.
+		assert_eq!(track_b.subscription().unwrap().group_start, Some(1));
 	}
 
 	#[tokio::test]
