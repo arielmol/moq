@@ -383,6 +383,79 @@ fn publish_catalog_roundtrip() {
 }
 
 #[test]
+fn raw_loc_video_uses_the_declared_catalog_container() {
+	let origin = id(moq_origin_create());
+	let path = b"raw-loc-video";
+	let broadcast = publish_broadcast(origin, path);
+
+	let name = b"video";
+	let track = id(unsafe { moq_publish_track(broadcast, name.as_ptr() as *const c_char, name.len(), std::ptr::null()) });
+
+	let codec = b"vp8";
+	let video = moq_video_config {
+		name: name.as_ptr() as *const c_char,
+		name_len: name.len(),
+		codec: codec.as_ptr() as *const c_char,
+		codec_len: codec.len(),
+		description: std::ptr::null(),
+		description_len: 0,
+		coded_width: std::ptr::null(),
+		coded_height: std::ptr::null(),
+	};
+	assert_eq!(
+		unsafe {
+			moq_publish_video_config_with_container(
+				broadcast,
+				&video,
+				moq_media_container::MOQ_MEDIA_CONTAINER_LOC as u32,
+			)
+		},
+		0
+	);
+
+	let consume = request_broadcast(origin, path);
+	let catalog_cb = Callback::new();
+	let catalog_task = id(unsafe { moq_consume_catalog(consume, Some(channel_callback), catalog_cb.ptr) });
+	let catalog = id(catalog_cb.recv());
+
+	let frame_cb = Callback::new();
+	let consumer = id(unsafe { moq_consume_video(catalog, 0, 10_000, Some(channel_callback), frame_cb.ptr) });
+
+	let timestamp_us = 42_000;
+	let payload = b"codec frame";
+	let loc = moq_loc::encode(timestamp_us, payload).unwrap();
+	let group = id(moq_publish_track_group(track));
+	assert_eq!(unsafe { moq_publish_group_frame(group, loc.as_ptr(), loc.len(), timestamp_us) }, 0);
+	assert_eq!(moq_publish_group_finish(group), 0);
+
+	let frame_id = id(frame_cb.recv());
+	let mut frame = moq_frame {
+		payload: std::ptr::null(),
+		payload_size: 0,
+		timestamp_us: 0,
+		keyframe: false,
+	};
+	assert_eq!(unsafe { moq_consume_frame(frame_id, &mut frame) }, 0);
+	assert_eq!(frame.timestamp_us, timestamp_us);
+	assert!(frame.keyframe);
+	assert_eq!(
+		unsafe { std::slice::from_raw_parts(frame.payload, frame.payload_size) },
+		payload
+	);
+
+	assert_eq!(moq_consume_frame_free(frame_id), 0);
+	assert_eq!(moq_consume_video_close(consumer), 0);
+	assert_eq!(frame_cb.recv_terminal(), 0);
+	assert_eq!(moq_consume_catalog_free(catalog), 0);
+	assert_eq!(moq_consume_catalog_close(catalog_task), 0);
+	assert_eq!(catalog_cb.recv_terminal(), 0);
+	assert_eq!(moq_consume_close(consume), 0);
+	assert_eq!(moq_publish_track_finish(track), 0);
+	assert_eq!(moq_publish_finish(broadcast), 0);
+	assert_eq!(moq_origin_close(origin), 0);
+}
+
+#[test]
 fn catalog_section_roundtrip() {
 	let origin = id(moq_origin_create());
 	let path = b"catalog-sections";

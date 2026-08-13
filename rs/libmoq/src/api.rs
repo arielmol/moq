@@ -1673,6 +1673,28 @@ pub unsafe extern "C" fn moq_publish_video_properties(broadcast: u32, properties
 	})
 }
 
+/// Container used by a manually authored media rendition.
+///
+/// The ABI accepts this as a `uint32_t`, so unknown values return
+/// `Error::InvalidCode` instead of constructing an invalid Rust enum.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug)]
+pub enum moq_media_container {
+	/// A QUIC VarInt timestamp prefix followed by the codec payload.
+	MOQ_MEDIA_CONTAINER_LEGACY = 0,
+	/// Low Overhead Container (draft-ietf-moq-loc).
+	MOQ_MEDIA_CONTAINER_LOC = 1,
+}
+
+fn media_container_from_u32(value: u32) -> Result<hang::catalog::Container, Error> {
+	Ok(match value {
+		v if v == moq_media_container::MOQ_MEDIA_CONTAINER_LEGACY as u32 => hang::catalog::Container::Legacy,
+		v if v == moq_media_container::MOQ_MEDIA_CONTAINER_LOC as u32 => hang::catalog::Container::Loc,
+		_ => return Err(Error::InvalidCode),
+	})
+}
+
 /// Add or replace a video rendition in a broadcast's catalog.
 ///
 /// This is the producer counterpart to [moq_consume_video_config]: instead of
@@ -1693,6 +1715,26 @@ pub unsafe extern "C" fn moq_publish_video_properties(broadcast: u32, properties
 /// - The caller must ensure each non-NULL pointer inside `config` is valid for its length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const moq_video_config) -> i32 {
+	unsafe {
+		moq_publish_video_config_with_container(broadcast, config, moq_media_container::MOQ_MEDIA_CONTAINER_LEGACY as u32)
+	}
+}
+
+/// Add or replace a video rendition with an explicit frame container.
+///
+/// LOC is intended for tracks created with [moq_publish_track] whose frames
+/// have already been encoded according to draft-ietf-moq-loc.
+///
+/// Returns a zero on success, or a negative code on failure.
+///
+/// # Safety
+/// - Same contract as [moq_publish_video_config].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_publish_video_config_with_container(
+	broadcast: u32,
+	config: *const moq_video_config,
+	container: u32,
+) -> i32 {
 	ffi::enter(move || {
 		let broadcast = ffi::parse_id(broadcast)?;
 		let config = unsafe { config.as_ref() }.ok_or(Error::InvalidPointer)?;
@@ -1708,6 +1750,7 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 		}
 		video.coded_width = unsafe { config.coded_width.as_ref() }.copied();
 		video.coded_height = unsafe { config.coded_height.as_ref() }.copied();
+		video.container = media_container_from_u32(container)?;
 
 		State::lock().publish.video_config(broadcast, name, video)
 	})
@@ -1731,6 +1774,23 @@ pub unsafe extern "C" fn moq_publish_video_config(broadcast: u32, config: *const
 /// - The caller must ensure each non-NULL pointer inside `config` is valid for its length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moq_publish_audio_config(broadcast: u32, config: *const moq_audio_config) -> i32 {
+	unsafe {
+		moq_publish_audio_config_with_container(broadcast, config, moq_media_container::MOQ_MEDIA_CONTAINER_LEGACY as u32)
+	}
+}
+
+/// Add or replace an audio rendition with an explicit frame container.
+///
+/// Returns a zero on success, or a negative code on failure.
+///
+/// # Safety
+/// - Same contract as [moq_publish_audio_config].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_publish_audio_config_with_container(
+	broadcast: u32,
+	config: *const moq_audio_config,
+	container: u32,
+) -> i32 {
 	ffi::enter(move || {
 		let broadcast = ffi::parse_id(broadcast)?;
 		let config = unsafe { config.as_ref() }.ok_or(Error::InvalidPointer)?;
@@ -1740,6 +1800,7 @@ pub unsafe extern "C" fn moq_publish_audio_config(broadcast: u32, config: *const
 		let codec = hang::catalog::AudioCodec::from_str(codec).map_err(Error::Hang)?;
 
 		let mut audio = hang::catalog::AudioConfig::new(codec, config.sample_rate, config.channel_count);
+		audio.container = media_container_from_u32(container)?;
 		if !config.description.is_null() {
 			let description = unsafe { ffi::parse_slice(config.description, config.description_len)? };
 			audio.description = Some(bytes::Bytes::copy_from_slice(description));
