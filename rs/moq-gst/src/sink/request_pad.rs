@@ -48,6 +48,17 @@ impl TrackReservation<'_> {
 			pad.notify("track");
 		}
 	}
+
+	/// Drop the effective name, then notify after releasing the lock.
+	pub(super) fn release(self) {
+		let TrackReservation { pad, mut settings } = self;
+		let before = settings.effective.take();
+		let changed = before.is_some() && before != settings.requested;
+		drop(settings);
+		if changed {
+			pad.notify("track");
+		}
+	}
 }
 
 #[glib::object_subclass]
@@ -132,13 +143,7 @@ impl MoqSinkPad {
 	/// Drop the reserved name once its producer is finalized, so the pad is configurable again on the
 	/// next run. The requested name stays: that run reserves the same one.
 	pub(super) fn release_track(&self) {
-		let mut settings = self.imp().settings.lock().unwrap();
-		let before = settings.effective.take();
-		let changed = before.is_some() && before != settings.requested;
-		drop(settings);
-		if changed {
-			self.notify("track");
-		}
+		self.reserve_track().release();
 	}
 }
 
@@ -179,5 +184,28 @@ mod tests {
 			"camera",
 			"the write rejected after reservation was not retained for the next run"
 		);
+	}
+
+	#[test]
+	fn track_release_can_share_the_reservation_lock() {
+		gst::init().unwrap();
+		let pad = gst::PadBuilder::<MoqSinkPad>::new(gst::PadDirection::Sink)
+			.name("sink_0")
+			.build();
+		pad.set_property("track", "camera");
+		pad.reserve_track().commit("camera".to_string());
+
+		let release = pad.reserve_track();
+		let other = pad.clone();
+		assert!(
+			std::thread::spawn(move || other.imp().settings.try_lock().is_err())
+				.join()
+				.unwrap(),
+			"CAPS cannot reserve a track while release removes its producer"
+		);
+		release.release();
+
+		pad.set_property("track", "other");
+		assert_eq!(pad.property::<String>("track"), "other");
 	}
 }

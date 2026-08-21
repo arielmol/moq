@@ -317,6 +317,9 @@ impl ElementImpl for MoqSink {
 	}
 
 	fn release_pad(&self, pad: &gst::Pad) {
+		// CAPS takes the pad lock before the element state lock. Keep the same order here so a CAPS
+		// handler cannot insert a producer after this removal.
+		let reservation = pad.downcast_ref::<MoqSinkPad>().map(MoqSinkPad::reserve_track);
 		{
 			let _rt = RUNTIME.enter();
 			if let Some(state) = self.state.lock().unwrap().as_mut() {
@@ -331,8 +334,8 @@ impl ElementImpl for MoqSink {
 		}
 		// The producer is gone, so the pad no longer holds a reservation: an application
 		// keeping the released pad reads what it asked for, not a name nothing publishes.
-		if let Some(pad) = pad.downcast_ref::<MoqSinkPad>() {
-			pad.release_track();
+		if let Some(reservation) = reservation {
+			reservation.release();
 		}
 		if self.obj().remove_pad(pad).is_ok() {
 			self.obj().child_removed(pad, pad.name().as_str());
