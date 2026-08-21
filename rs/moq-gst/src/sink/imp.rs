@@ -458,7 +458,8 @@ impl MoqSink {
 					return false;
 				}
 				if let Some(sink_pad) = pad.downcast_ref::<MoqSinkPad>() {
-					sink_pad.reserve_track(|requested| {
+					let reservation = sink_pad.reserve_track();
+					let reserved = {
 						let _rt = RUNTIME.enter();
 						let mut guard = self.state.lock().unwrap();
 						guard.as_mut().and_then(|state| {
@@ -471,9 +472,12 @@ impl MoqSink {
 							let catalog = catalog.as_ref()?;
 							pads.entry(pad.name().to_string())
 								.or_insert_with(Pad::new)
-								.observe_caps(broadcast, catalog, &caps, requested)
+								.observe_caps(broadcast, catalog, &caps, reservation.requested())
 						})
-					});
+					};
+					if let Some(track) = reserved {
+						reservation.commit(track);
+					}
 				}
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}

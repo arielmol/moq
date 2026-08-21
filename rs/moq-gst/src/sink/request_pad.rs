@@ -1,7 +1,7 @@
 //! The `sink_%u` request pad as its own GObject, so the track it publishes can be named from a
 //! pipeline description through `GstChildProxy` (`moqsink sink_0::track=camera`).
 
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use gst::glib;
 use gst::prelude::*;
@@ -23,6 +23,31 @@ struct Settings {
 #[derive(Debug, Default)]
 pub struct MoqSinkPadImp {
 	settings: Mutex<Settings>,
+}
+
+/// A pending track reservation that serializes property writes until it is committed or dropped.
+pub(super) struct TrackReservation<'a> {
+	pad: &'a MoqSinkPad,
+	settings: MutexGuard<'a, Settings>,
+}
+
+impl TrackReservation<'_> {
+	/// The name configured when this reservation began.
+	pub(super) fn requested(&self) -> Option<&str> {
+		self.settings.requested.as_deref()
+	}
+
+	/// Fix the property to the name the broadcast reserved, then notify after releasing the lock.
+	pub(super) fn commit(self, track: String) {
+		let TrackReservation { pad, mut settings } = self;
+		let before = settings.effective.clone().or_else(|| settings.requested.clone());
+		settings.effective = Some(track);
+		let changed = before != settings.effective;
+		drop(settings);
+		if changed {
+			pad.notify("track");
+		}
+	}
 }
 
 #[glib::object_subclass]
@@ -96,18 +121,11 @@ glib::wrapper! {
 }
 
 impl MoqSinkPad {
-	/// Reserve a track under the configured name and fix the property for the producer's lifetime.
-	pub(super) fn reserve_track(&self, reserve: impl FnOnce(Option<&str>) -> Option<String>) {
-		let mut settings = self.imp().settings.lock().unwrap();
-		let before = settings.effective.clone().or_else(|| settings.requested.clone());
-		let Some(track) = reserve(settings.requested.as_deref()) else {
-			return;
-		};
-		settings.effective = Some(track);
-		let changed = before != settings.effective;
-		drop(settings);
-		if changed {
-			self.notify("track");
+	/// Lock the configured name until the caller commits or abandons its track reservation.
+	pub(super) fn reserve_track(&self) -> TrackReservation<'_> {
+		TrackReservation {
+			pad: self,
+			settings: self.imp().settings.lock().unwrap(),
 		}
 	}
 
@@ -136,17 +154,23 @@ mod tests {
 			.build();
 		pad.set_property("track", "camera");
 
-		pad.reserve_track(|requested| {
-			assert_eq!(requested, Some("camera"));
-			let pad = pad.clone();
-			assert!(
-				std::thread::spawn(move || pad.imp().settings.try_lock().is_err())
-					.join()
-					.unwrap(),
-				"a concurrent property write cannot enter during reservation"
-			);
-			Some("camera".to_string())
-		});
+		let abandoned = pad.reserve_track();
+		assert_eq!(abandoned.requested(), Some("camera"));
+		drop(abandoned);
+		pad.set_property("track", "other");
+		assert_eq!(pad.property::<String>("track"), "other");
+		pad.set_property("track", "camera");
+
+		let reservation = pad.reserve_track();
+		assert_eq!(reservation.requested(), Some("camera"));
+		let other = pad.clone();
+		assert!(
+			std::thread::spawn(move || other.imp().settings.try_lock().is_err())
+				.join()
+				.unwrap(),
+			"a concurrent property write cannot enter during reservation"
+		);
+		reservation.commit("camera".to_string());
 
 		pad.set_property("track", "other");
 		pad.release_track();
