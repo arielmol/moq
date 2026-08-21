@@ -161,12 +161,21 @@ impl ObjectImpl for MoqSrc {
 		// write would leave a value that reads back but never took effect. The
 		// pending state covers the transition itself, where the session is already
 		// built while the current state still reads READY.
+		//
+		// The lock is taken before the state is read, and start_session takes the
+		// same one to copy the settings: either this write lands in that copy, or
+		// it runs afterwards and finds the state above READY.
+		let mut settings = self.settings.lock().unwrap();
 		let obj = self.obj();
 		if obj.current_state() > gst::State::Ready || obj.pending_state() > gst::State::Ready {
-			gst::warning!(CAT, obj = obj, "{} ignored: the element is already started", pspec.name());
+			gst::warning!(
+				CAT,
+				obj = obj,
+				"{} ignored: the element is already started",
+				pspec.name()
+			);
 			return;
 		}
-		let mut settings = self.settings.lock().unwrap();
 		match pspec.name() {
 			"url" => settings.url = value.get().unwrap(),
 			"broadcast" => settings.broadcast = value.get().unwrap(),
