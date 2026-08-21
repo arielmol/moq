@@ -33,14 +33,17 @@ fn publisher() -> gst::Element {
 		.expect("create moqsink")
 }
 
+fn h264_caps() -> gst::Caps {
+	gst::Caps::builder("video/x-h264")
+		.field("stream-format", "byte-stream")
+		.field("alignment", "au")
+		.build()
+}
+
 /// Drive one pad to the point where it reserves its track: STREAM_START keeps the sticky events in
 /// order, CAPS builds the producer.
 fn send_caps(pad: &gst::Pad) -> bool {
-	let caps = gst::Caps::builder("video/x-h264")
-		.field("stream-format", "byte-stream")
-		.field("alignment", "au")
-		.build();
-	pad.send_event(gst::event::StreamStart::new("test")) && pad.send_event(gst::event::Caps::new(&caps))
+	pad.send_event(gst::event::StreamStart::new("test")) && pad.send_event(gst::event::Caps::new(&h264_caps()))
 }
 
 // Request pads appear and disappear through the real GObject boundary, with no session attached.
@@ -165,7 +168,7 @@ fn an_unnamed_pad_reads_back_its_generated_name() {
 // detaches the pad. Re-enter CAPS handling from that exact window: it must be rejected, and a new pad
 // with the same GStreamer name must build a fresh producer instead of finding a ghost one in the map.
 #[test]
-fn release_rejects_caps_before_the_pad_is_detached() {
+fn release_rejects_pad_traffic_before_detach() {
 	init();
 	let sink = publisher();
 	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
@@ -176,13 +179,22 @@ fn release_rejects_caps_before_the_pad_is_detached() {
 	assert_eq!(child.property::<Option<String>>("track").as_deref(), Some("0.avc3"));
 
 	let attempted = Arc::new(AtomicBool::new(false));
-	let accepted = Arc::new(AtomicBool::new(false));
+	let caps_accepted = Arc::new(AtomicBool::new(false));
+	let eos_accepted = Arc::new(AtomicBool::new(false));
+	let buffer_accepted = Arc::new(AtomicBool::new(false));
 	let attempted_notify = attempted.clone();
-	let accepted_notify = accepted.clone();
+	let caps_notify = caps_accepted.clone();
+	let eos_notify = eos_accepted.clone();
+	let buffer_notify = buffer_accepted.clone();
 	let pad_notify = pad.clone();
 	child.connect_notify(Some("track"), move |_, _| {
 		if !attempted_notify.swap(true, Ordering::SeqCst) {
-			accepted_notify.store(send_caps(&pad_notify), Ordering::SeqCst);
+			caps_notify.store(
+				pad_notify.send_event(gst::event::Caps::new(&h264_caps())),
+				Ordering::SeqCst,
+			);
+			eos_notify.store(pad_notify.send_event(gst::event::Eos::new()), Ordering::SeqCst);
+			buffer_notify.store(pad_notify.chain(gst::Buffer::new()).is_ok(), Ordering::SeqCst);
 		}
 	});
 
@@ -191,7 +203,18 @@ fn release_rejects_caps_before_the_pad_is_detached() {
 		attempted.load(Ordering::SeqCst),
 		"release reached the vulnerable notify window"
 	);
-	assert!(!accepted.load(Ordering::SeqCst), "CAPS was rejected once release began");
+	assert!(
+		!caps_accepted.load(Ordering::SeqCst),
+		"CAPS was rejected once release began"
+	);
+	assert!(
+		!eos_accepted.load(Ordering::SeqCst),
+		"EOS was rejected once release began"
+	);
+	assert!(
+		!buffer_accepted.load(Ordering::SeqCst),
+		"a buffer was rejected once release began"
+	);
 
 	let replacement = sink.request_pad_simple("sink_0").expect("request replacement sink_0");
 	assert!(send_caps(&replacement), "the replacement CAPS event is accepted");

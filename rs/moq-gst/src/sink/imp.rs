@@ -417,6 +417,9 @@ impl MoqSink {
 		})?;
 		let data = Bytes::copy_from_slice(map.as_slice());
 		drop(map);
+		let Some(activity) = pad.downcast_ref::<MoqSinkPad>().and_then(MoqSinkPad::reserve_track) else {
+			return Err(gst::FlowError::Flushing);
+		};
 
 		// Producer writes can touch tokio time (group eviction), so hold the runtime context here.
 		let _rt = RUNTIME.enter();
@@ -441,6 +444,7 @@ impl MoqSink {
 
 		let no_segment = media.push_buffer(data, pts);
 		drop(guard);
+		drop(activity);
 
 		if no_segment {
 			gst::element_warning!(
@@ -456,6 +460,9 @@ impl MoqSink {
 	}
 
 	fn handle_event(&self, pad: &gst::Pad, event: gst::Event) -> bool {
+		let Some(reservation) = pad.downcast_ref::<MoqSinkPad>().and_then(MoqSinkPad::reserve_track) else {
+			return false;
+		};
 		match event.view() {
 			gst::EventView::Caps(caps) => {
 				let caps = caps.caps().to_owned();
@@ -464,29 +471,24 @@ impl MoqSink {
 					gst::warning!(CAT, "rejecting unsupported caps on pad {}", pad.name());
 					return false;
 				}
-				if let Some(sink_pad) = pad.downcast_ref::<MoqSinkPad>() {
-					let Some(reservation) = sink_pad.reserve_track() else {
-						return false;
-					};
-					let reserved = {
-						let _rt = RUNTIME.enter();
-						let mut guard = self.state.lock().unwrap();
-						guard.as_mut().and_then(|state| {
-							let State {
-								broadcast,
-								catalog,
-								pads,
-								..
-							} = state;
-							let catalog = catalog.as_ref()?;
-							pads.entry(pad.name().to_string())
-								.or_insert_with(Pad::new)
-								.observe_caps(broadcast, catalog, &caps, reservation.requested())
-						})
-					};
-					if let Some(track) = reserved {
-						reservation.commit(track);
-					}
+				let reserved = {
+					let _rt = RUNTIME.enter();
+					let mut guard = self.state.lock().unwrap();
+					guard.as_mut().and_then(|state| {
+						let State {
+							broadcast,
+							catalog,
+							pads,
+							..
+						} = state;
+						let catalog = catalog.as_ref()?;
+						pads.entry(pad.name().to_string())
+							.or_insert_with(Pad::new)
+							.observe_caps(broadcast, catalog, &caps, reservation.requested())
+					})
+				};
+				if let Some(track) = reserved {
+					reservation.commit(track);
 				}
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
@@ -498,10 +500,12 @@ impl MoqSink {
 						.or_insert_with(Pad::new)
 						.observe_segment(segment.segment().to_owned());
 				}
+				drop(reservation);
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
 			gst::EventView::Eos(_) => {
 				self.handle_eos(pad);
+				drop(reservation);
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
 			// FLUSH_STOP re-anchors the timeline; the trailing SEGMENT is accepted fresh. The producer is
@@ -512,9 +516,14 @@ impl MoqSink {
 				{
 					media.flush();
 				}
+				drop(reservation);
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
-			_ => gst::Pad::event_default(pad, Some(&*self.obj()), event),
+			_ => {
+				let handled = gst::Pad::event_default(pad, Some(&*self.obj()), event);
+				drop(reservation);
+				handled
+			}
 		}
 	}
 
