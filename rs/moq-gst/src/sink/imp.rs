@@ -17,6 +17,7 @@ use gst::subclass::prelude::*;
 use hang::moq_net;
 
 use super::pad::{Pad, caps_supported};
+use super::request_pad::MoqSinkPad;
 use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session};
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +111,7 @@ impl ObjectSubclass for MoqSink {
 	const NAME: &'static str = "MoqSink";
 	type Type = super::MoqSink;
 	type ParentType = gst::Element;
+	type Interfaces = (gst::ChildProxy,);
 }
 
 impl ObjectImpl for MoqSink {
@@ -204,6 +206,26 @@ impl ObjectImpl for MoqSink {
 
 impl GstObjectImpl for MoqSink {}
 
+/// Request pads are reachable as children, which is how a pipeline description names their tracks
+/// (`moqsink sink_0::track=camera`).
+impl ChildProxyImpl for MoqSink {
+	fn children_count(&self) -> u32 {
+		self.obj().num_pads() as u32
+	}
+
+	fn child_by_name(&self, name: &str) -> Option<glib::Object> {
+		self.obj().static_pad(name).map(|pad| pad.upcast())
+	}
+
+	fn child_by_index(&self, index: u32) -> Option<glib::Object> {
+		self.obj()
+			.pads()
+			.into_iter()
+			.nth(index as usize)
+			.map(|pad| pad.upcast())
+	}
+}
+
 impl ElementImpl for MoqSink {
 	fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
 		static METADATA: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
@@ -269,16 +291,20 @@ impl ElementImpl for MoqSink {
 		// Wrap both pad functions in catch_panic_pad_function: these run on the streaming thread across the
 		// C FFI boundary, and they hit `state.lock().unwrap()` (poisonable) and `expect()`. An escaping
 		// panic would abort the process; here it becomes a clean FlowError / `false` instead.
-		let pad_builder = gst::Pad::builder_from_template(templ)
+		let pad_builder = gst::PadBuilder::<MoqSinkPad>::from_template(templ)
 			.chain_function(|pad, parent, buffer| {
 				MoqSink::catch_panic_pad_function(
 					parent,
 					|| Err(gst::FlowError::Error),
-					|this| this.forward_buffer(pad, buffer),
+					|this| this.forward_buffer(pad.upcast_ref::<gst::Pad>(), buffer),
 				)
 			})
 			.event_function(|pad, parent, event| {
-				MoqSink::catch_panic_pad_function(parent, || false, |this| this.handle_event(pad, event))
+				MoqSink::catch_panic_pad_function(
+					parent,
+					|| false,
+					|this| this.handle_event(pad.upcast_ref::<gst::Pad>(), event),
+				)
 			});
 
 		let pad = match name {
@@ -286,7 +312,8 @@ impl ElementImpl for MoqSink {
 			None => pad_builder.generated_name().build(),
 		};
 		self.obj().add_pad(&pad).ok()?;
-		Some(pad)
+		self.obj().child_added(&pad, pad.name().as_str());
+		Some(pad.upcast())
 	}
 
 	fn release_pad(&self, pad: &gst::Pad) {
@@ -302,7 +329,14 @@ impl ElementImpl for MoqSink {
 				state.ended.remove(name.as_str());
 			}
 		}
-		let _ = self.obj().remove_pad(pad);
+		// The producer is gone, so the pad no longer holds a reservation: an application
+		// keeping the released pad reads what it asked for, not a name nothing publishes.
+		if let Some(pad) = pad.downcast_ref::<MoqSinkPad>() {
+			pad.release_track();
+		}
+		if self.obj().remove_pad(pad).is_ok() {
+			self.obj().child_removed(pad, pad.name().as_str());
+		}
 		// Removing a still-active pad can leave only already-ended pads, which now satisfies EOS.
 		self.maybe_post_eos();
 	}
@@ -353,6 +387,12 @@ impl MoqSink {
 		// warning) before reaping the session task.
 		state.broadcast.finish();
 		state.session.stop();
+		// The producers are gone, so each pad's name is configurable again for the next run.
+		for pad in self.obj().sink_pads() {
+			if let Some(pad) = pad.downcast_ref::<MoqSinkPad>() {
+				pad.release_track();
+			}
+		}
 	}
 
 	/// Write one buffer straight into its pad's producer. Per-pad failures (bad caps/bitstream) drop
@@ -417,19 +457,28 @@ impl MoqSink {
 					gst::warning!(CAT, "rejecting unsupported caps on pad {}", pad.name());
 					return false;
 				}
-				let _rt = RUNTIME.enter();
-				if let Some(state) = self.state.lock().unwrap().as_mut() {
-					let State {
-						broadcast,
-						catalog,
-						pads,
-						..
-					} = state;
-					if let Some(catalog) = catalog.as_ref() {
+				let sink_pad = pad.downcast_ref::<MoqSinkPad>();
+				let requested = sink_pad.and_then(MoqSinkPad::requested_track);
+				let reserved = {
+					let _rt = RUNTIME.enter();
+					let mut guard = self.state.lock().unwrap();
+					guard.as_mut().and_then(|state| {
+						let State {
+							broadcast,
+							catalog,
+							pads,
+							..
+						} = state;
+						let catalog = catalog.as_ref()?;
 						pads.entry(pad.name().to_string())
 							.or_insert_with(Pad::new)
-							.observe_caps(broadcast, catalog, &caps);
-					}
+							.observe_caps(broadcast, catalog, &caps, requested.as_deref())
+					})
+				};
+				// A notify handler can read this pad, so the reserved name is published with the state
+				// lock released.
+				if let (Some(sink_pad), Some(track)) = (sink_pad, reserved) {
+					sink_pad.commit_track(track);
 				}
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
