@@ -3,7 +3,8 @@
 //! Flows that need a connected session (multipad EOS aggregation, per-pad error propagation, remote
 //! close) are validated against a real relay, separately from this hermetic suite.
 
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 
 use gst::prelude::*;
 
@@ -158,6 +159,48 @@ fn an_unnamed_pad_reads_back_its_generated_name() {
 	assert!(send_caps(&pad), "the CAPS event is accepted");
 	assert_eq!(child.property::<String>("track"), "0.avc3");
 	let _ = sink.set_state(gst::State::Null);
+}
+
+// Releasing an active pad emits notify::track after its producer is removed but before GStreamer
+// detaches the pad. Re-enter CAPS handling from that exact window: it must be rejected, and a new pad
+// with the same GStreamer name must build a fresh producer instead of finding a ghost one in the map.
+#[test]
+fn release_rejects_caps_before_the_pad_is_detached() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let child = child_of(&sink, "sink_0");
+	sink.set_state(gst::State::Paused)
+		.expect("Ready -> Paused starts the session");
+	assert!(send_caps(&pad), "the initial CAPS event is accepted");
+	assert_eq!(child.property::<Option<String>>("track").as_deref(), Some("0.avc3"));
+
+	let attempted = Arc::new(AtomicBool::new(false));
+	let accepted = Arc::new(AtomicBool::new(false));
+	let attempted_notify = attempted.clone();
+	let accepted_notify = accepted.clone();
+	let pad_notify = pad.clone();
+	child.connect_notify(Some("track"), move |_, _| {
+		if !attempted_notify.swap(true, Ordering::SeqCst) {
+			accepted_notify.store(send_caps(&pad_notify), Ordering::SeqCst);
+		}
+	});
+
+	sink.release_request_pad(&pad);
+	assert!(
+		attempted.load(Ordering::SeqCst),
+		"release reached the vulnerable notify window"
+	);
+	assert!(!accepted.load(Ordering::SeqCst), "CAPS was rejected once release began");
+
+	let replacement = sink.request_pad_simple("sink_0").expect("request replacement sink_0");
+	assert!(send_caps(&replacement), "the replacement CAPS event is accepted");
+	let replacement_track = child_of(&sink, "sink_0").property::<Option<String>>("track");
+	let _ = sink.set_state(gst::State::Null);
+	assert!(
+		replacement_track.is_some(),
+		"the removed pad left no ghost producer under sink_0"
+	);
 }
 
 // Settings are validated synchronously: a missing url fails the state change, not the bus.

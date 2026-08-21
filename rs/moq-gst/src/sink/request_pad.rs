@@ -17,6 +17,8 @@ struct Settings {
 	/// The name the broadcast actually reserved. Present only while that producer lives, and while it is
 	/// present the property is fixed.
 	effective: Option<String>,
+	/// Blocks CAPS from creating a producer while the element removes this pad.
+	releasing: bool,
 }
 
 /// The GObject implementation backing a named `moqsink` request pad.
@@ -92,6 +94,15 @@ impl ObjectImpl for MoqSinkPadImp {
 
 	fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
 		let mut settings = self.settings.lock().unwrap();
+		if settings.releasing {
+			gst::warning!(
+				CAT,
+				obj = self.obj(),
+				"{} ignored: the pad is being released",
+				pspec.name()
+			);
+			return;
+		}
 		// A producer keeps the name it reserved for its whole life, so a later write would read back
 		// without ever reaching the broadcast or the catalog.
 		if settings.effective.is_some() {
@@ -133,17 +144,32 @@ glib::wrapper! {
 
 impl MoqSinkPad {
 	/// Lock the configured name until the caller commits or abandons its track reservation.
-	pub(super) fn reserve_track(&self) -> TrackReservation<'_> {
-		TrackReservation {
-			pad: self,
-			settings: self.imp().settings.lock().unwrap(),
+	pub(super) fn reserve_track(&self) -> Option<TrackReservation<'_>> {
+		let settings = self.imp().settings.lock().unwrap();
+		if settings.releasing {
+			return None;
 		}
+		Some(TrackReservation { pad: self, settings })
+	}
+
+	/// Mark the pad as releasing and lock its track settings during producer removal.
+	pub(super) fn retire_track(&self) -> TrackReservation<'_> {
+		let mut settings = self.imp().settings.lock().unwrap();
+		settings.releasing = true;
+		TrackReservation { pad: self, settings }
+	}
+
+	/// Make a detached pad configurable after CAPS can no longer reach the element.
+	pub(super) fn finish_release(&self) {
+		self.imp().settings.lock().unwrap().releasing = false;
 	}
 
 	/// Drop the reserved name once its producer is finalized, so the pad is configurable again on the
 	/// next run. The requested name stays: that run reserves the same one.
 	pub(super) fn release_track(&self) {
-		self.reserve_track().release();
+		if let Some(reservation) = self.reserve_track() {
+			reservation.release();
+		}
 	}
 }
 
@@ -159,14 +185,14 @@ mod tests {
 			.build();
 		pad.set_property("track", "camera");
 
-		let abandoned = pad.reserve_track();
+		let abandoned = pad.reserve_track().unwrap();
 		assert_eq!(abandoned.requested(), Some("camera"));
 		drop(abandoned);
 		pad.set_property("track", "other");
 		assert_eq!(pad.property::<String>("track"), "other");
 		pad.set_property("track", "camera");
 
-		let reservation = pad.reserve_track();
+		let reservation = pad.reserve_track().unwrap();
 		assert_eq!(reservation.requested(), Some("camera"));
 		let other = pad.clone();
 		assert!(
@@ -184,28 +210,5 @@ mod tests {
 			"camera",
 			"the write rejected after reservation was not retained for the next run"
 		);
-	}
-
-	#[test]
-	fn track_release_can_share_the_reservation_lock() {
-		gst::init().unwrap();
-		let pad = gst::PadBuilder::<MoqSinkPad>::new(gst::PadDirection::Sink)
-			.name("sink_0")
-			.build();
-		pad.set_property("track", "camera");
-		pad.reserve_track().commit("camera".to_string());
-
-		let release = pad.reserve_track();
-		let other = pad.clone();
-		assert!(
-			std::thread::spawn(move || other.imp().settings.try_lock().is_err())
-				.join()
-				.unwrap(),
-			"CAPS cannot reserve a track while release removes its producer"
-		);
-		release.release();
-
-		pad.set_property("track", "other");
-		assert_eq!(pad.property::<String>("track"), "other");
 	}
 }
