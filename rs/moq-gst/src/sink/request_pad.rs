@@ -19,6 +19,7 @@ struct Settings {
 	effective: Option<String>,
 }
 
+/// The GObject implementation backing a named `moqsink` request pad.
 #[derive(Debug, Default)]
 pub struct MoqSinkPadImp {
 	settings: Mutex<Settings>,
@@ -95,16 +96,13 @@ glib::wrapper! {
 }
 
 impl MoqSinkPad {
-	/// The name configured for this pad, read at the CAPS event to reserve the track.
-	pub(super) fn requested_track(&self) -> Option<String> {
-		self.imp().settings.lock().unwrap().requested.clone()
-	}
-
-	/// Record the name the broadcast reserved, fixing the property for the producer's lifetime. The
-	/// caller must not hold the element state lock: `notify` runs handlers that read properties.
-	pub(super) fn commit_track(&self, track: String) {
+	/// Reserve a track under the configured name and fix the property for the producer's lifetime.
+	pub(super) fn reserve_track(&self, reserve: impl FnOnce(Option<&str>) -> Option<String>) {
 		let mut settings = self.imp().settings.lock().unwrap();
 		let before = settings.effective.clone().or_else(|| settings.requested.clone());
+		let Some(track) = reserve(settings.requested.as_deref()) else {
+			return;
+		};
 		settings.effective = Some(track);
 		let changed = before != settings.effective;
 		drop(settings);
@@ -123,5 +121,39 @@ impl MoqSinkPad {
 		if changed {
 			self.notify("track");
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn track_selection_is_locked_until_the_reservation_is_committed() {
+		gst::init().unwrap();
+		let pad = gst::PadBuilder::<MoqSinkPad>::new(gst::PadDirection::Sink)
+			.name("sink_0")
+			.build();
+		pad.set_property("track", "camera");
+
+		pad.reserve_track(|requested| {
+			assert_eq!(requested, Some("camera"));
+			let pad = pad.clone();
+			assert!(
+				std::thread::spawn(move || pad.imp().settings.try_lock().is_err())
+					.join()
+					.unwrap(),
+				"a concurrent property write cannot enter during reservation"
+			);
+			Some("camera".to_string())
+		});
+
+		pad.set_property("track", "other");
+		pad.release_track();
+		assert_eq!(
+			pad.property::<String>("track"),
+			"camera",
+			"the write rejected after reservation was not retained for the next run"
+		);
 	}
 }

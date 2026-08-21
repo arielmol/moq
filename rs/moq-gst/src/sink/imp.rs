@@ -457,28 +457,23 @@ impl MoqSink {
 					gst::warning!(CAT, "rejecting unsupported caps on pad {}", pad.name());
 					return false;
 				}
-				let sink_pad = pad.downcast_ref::<MoqSinkPad>();
-				let requested = sink_pad.and_then(MoqSinkPad::requested_track);
-				let reserved = {
-					let _rt = RUNTIME.enter();
-					let mut guard = self.state.lock().unwrap();
-					guard.as_mut().and_then(|state| {
-						let State {
-							broadcast,
-							catalog,
-							pads,
-							..
-						} = state;
-						let catalog = catalog.as_ref()?;
-						pads.entry(pad.name().to_string())
-							.or_insert_with(Pad::new)
-							.observe_caps(broadcast, catalog, &caps, requested.as_deref())
-					})
-				};
-				// A notify handler can read this pad, so the reserved name is published with the state
-				// lock released.
-				if let (Some(sink_pad), Some(track)) = (sink_pad, reserved) {
-					sink_pad.commit_track(track);
+				if let Some(sink_pad) = pad.downcast_ref::<MoqSinkPad>() {
+					sink_pad.reserve_track(|requested| {
+						let _rt = RUNTIME.enter();
+						let mut guard = self.state.lock().unwrap();
+						guard.as_mut().and_then(|state| {
+							let State {
+								broadcast,
+								catalog,
+								pads,
+								..
+							} = state;
+							let catalog = catalog.as_ref()?;
+							pads.entry(pad.name().to_string())
+								.or_insert_with(Pad::new)
+								.observe_caps(broadcast, catalog, &caps, requested)
+						})
+					});
 				}
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
