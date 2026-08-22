@@ -466,17 +466,22 @@ impl MoqSink {
 			return Ok(gst::FlowSuccess::Ok); // drop quietly; the pad already reported its failure
 		}
 
-		let no_segment = media.push_buffer(data, pts, current_running_time).map_err(|err| {
-			gst::element_error!(
-				self.obj(),
-				gst::StreamError::Format,
-				("could not timestamp buffer on pad {}", pad.name()),
-				["{err}"]
-			);
-			gst::FlowError::Error
-		})?;
+		let result = media.push_buffer(data, pts, current_running_time);
 		drop(guard);
 		drop(activity);
+		let no_segment = match result {
+			Ok(no_segment) => no_segment,
+			Err(err) => {
+				// Bus sync handlers run inline and may read a property that locks `state` again.
+				gst::element_error!(
+					self.obj(),
+					gst::StreamError::Format,
+					("could not timestamp buffer on pad {}", pad.name()),
+					["{err}"]
+				);
+				return Err(gst::FlowError::Error);
+			}
+		};
 
 		if no_segment {
 			gst::element_warning!(

@@ -275,9 +275,10 @@ unreachable, and a pad without one is invalidated. It also requires a TIME segme
 sources such as `filesrc` and `fdsrc` push a BYTES segment, and every buffer behind one is dropped
 with a single warning on the bus.
 
-Each buffer becomes one group holding one frame, stamped with the buffer's PTS mapped through that
-segment. A buffer without a PTS is stamped with the pipeline's current running time, which keeps it in
-the same epoch as the media tracks without discarding the data.
+Each accepted buffer becomes one group holding one frame, stamped with the buffer's PTS mapped through
+that segment. A buffer without a PTS uses the pipeline's current running time when available. If running
+time is unavailable, timestamping fails. Frames larger than the group cache limit are rejected before
+their group is created.
 
 The track is deliberately absent from the catalog. MSF requires a `packaging` value on every declared
 track and defines none for raw bytes, so a consumer is told out of band, by configuration, which data
