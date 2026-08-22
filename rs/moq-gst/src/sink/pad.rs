@@ -288,26 +288,39 @@ impl Pad {
 	}
 
 	/// Import one buffer into the producer. A failed or producer-less pad drops the buffer; a timeline
-	/// drop is logged. A bad bitstream (or an oversized frame, rejected by moq-net) invalidates only this
-	/// pad.
+	/// drop is logged. Unstamped opaque data on an active timeline uses the element's current running
+	/// time. A bad bitstream (or an oversized frame, rejected by moq-net) invalidates only this pad.
 	/// Returns `true` the first time a buffer is dropped because the pad has no TIME segment, so the
-	/// caller can surface it once on the bus: without a timeline the pad can never publish.
-	pub fn push_buffer(&mut self, data: Bytes, pts: Option<gst::ClockTime>) -> bool {
+	/// caller can surface it once on the bus. Returns an error when an unstamped opaque buffer has no
+	/// current running time, so the caller fails the flow instead of silently dropping data.
+	pub fn push_buffer(
+		&mut self,
+		data: Bytes,
+		pts: Option<gst::ClockTime>,
+		current_running_time: Option<gst::ClockTime>,
+	) -> std::result::Result<bool, &'static str> {
 		if self.failed {
-			return false;
+			return Ok(false);
 		}
-		let timestamp = self.frame_timestamp(pts);
 		if self.track.is_none() {
 			gst::warning!(CAT, "dropping buffer received before caps");
-			return false;
+			return Ok(false);
 		}
+		let opaque = matches!(self.track.as_ref(), Some(Producer::Opaque(_)));
+		let timestamp = if opaque && pts.is_none() && self.state == PadState::Active {
+			let running_time = current_running_time.ok_or("no current running time for unstamped opaque data")?;
+			let nanos = i64::try_from(running_time.nseconds()).map_err(|_| "current running time is out of range")?;
+			frame_micros(Some(nanos))
+		} else {
+			self.frame_timestamp(pts)
+		};
 		match timestamp {
 			Ok(micros) => {
 				let ts = hang::container::Timestamp::from_micros(micros).ok();
 				// Resolved before acting on it: `fail()` needs `self` back.
 				let result = match self.track.as_mut().expect("track present") {
 					Producer::Media(track) => Some(track.decode(&data, ts).map_err(|err| err.to_string())),
-					// A raw frame carries its timestamp, so there is nothing to publish without one.
+					// Opaque data bypasses the codec/container importer and writes one group directly.
 					Producer::Opaque(producer) => {
 						ts.map(|ts| producer.write_frame(ts, &data).map_err(|err| err.to_string()))
 					}
@@ -320,14 +333,14 @@ impl Pad {
 					Some(Ok(())) => {}
 					None => gst::warning!(CAT, "dropping frame: timestamp out of range"),
 				}
-				false
+				Ok(false)
 			}
 			Err(reason) => {
 				gst::warning!(CAT, "dropping frame: {reason}");
 				// A pad stuck in NoSegment has no timeline and will never publish; report it once.
 				let first = self.state == PadState::NoSegment && !self.no_segment_reported;
 				self.no_segment_reported |= first;
-				first
+				Ok(first)
 			}
 		}
 	}
@@ -467,7 +480,8 @@ mod tests {
 			"the reserved name is the requested one"
 		);
 		pad.observe_segment(time_segment());
-		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO));
+		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None)
+			.unwrap();
 
 		let snapshot = catalog.snapshot();
 		let renditions: Vec<String> = snapshot.video.renditions.keys().map(|name| name.to_string()).collect();
@@ -568,11 +582,13 @@ mod tests {
 		pad.observe_caps(&broadcast, &catalog, &h264_caps(), None);
 		// No observe_segment: the pad stays in NoSegment.
 		assert!(
-			pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO)),
+			pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None)
+				.unwrap(),
 			"first no-segment buffer is reported"
 		);
 		assert!(
-			!pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO)),
+			!pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None)
+				.unwrap(),
 			"subsequent no-segment buffers are not re-reported"
 		);
 	}
@@ -614,7 +630,9 @@ mod tests {
 		data.observe_caps(&broadcast, &catalog, &opaque_caps(), Some("audiolevels"));
 		assert!(!data.is_failed());
 		video.observe_segment(time_segment());
-		video.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO));
+		video
+			.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None)
+			.unwrap();
 
 		let snapshot = catalog.snapshot();
 		let renditions: Vec<String> = snapshot.video.renditions.keys().map(|name| name.to_string()).collect();
@@ -637,8 +655,15 @@ mod tests {
 		pad.push_buffer(
 			Bytes::from_static(b"\x00\xffLEVELS"),
 			Some(gst::ClockTime::from_mseconds(40)),
-		);
-		pad.push_buffer(Bytes::from_static(b"second"), Some(gst::ClockTime::from_mseconds(80)));
+			None,
+		)
+		.unwrap();
+		pad.push_buffer(
+			Bytes::from_static(b"second"),
+			Some(gst::ClockTime::from_mseconds(80)),
+			None,
+		)
+		.unwrap();
 
 		let mut subscriber = broadcast
 			.consume()
@@ -695,21 +720,22 @@ mod tests {
 		);
 	}
 
-	// A buffer with no PTS is dropped rather than stamped with something invented, and the pad keeps
-	// publishing the ones that do carry a timestamp.
+	// A buffer with no PTS uses the pipeline's current running time, preserving the data and the media
+	// timeline's epoch.
 	#[tokio::test]
-	async fn an_opaque_pad_drops_a_buffer_without_pts() {
+	async fn an_opaque_pad_stamps_a_buffer_without_pts_with_current_running_time() {
 		gst::init().unwrap();
 		let (broadcast, catalog) = producers();
 		let mut pad = Pad::new();
 		pad.observe_caps(&broadcast, &catalog, &opaque_caps(), Some("audiolevels"));
 		pad.observe_segment(time_segment());
-		pad.push_buffer(Bytes::from_static(b"no pts"), None);
-		pad.push_buffer(Bytes::from_static(b"stamped"), Some(gst::ClockTime::from_mseconds(40)));
-		assert!(
-			!pad.is_failed(),
-			"a missing PTS drops the buffer, it does not fail the pad"
-		);
+		pad.push_buffer(
+			Bytes::from_static(b"no pts"),
+			None,
+			Some(gst::ClockTime::from_mseconds(25)),
+		)
+		.unwrap();
+		assert!(!pad.is_failed(), "a missing PTS uses the supplied running time");
 
 		let mut subscriber = broadcast
 			.consume()
@@ -720,10 +746,22 @@ mod tests {
 			.expect("subscribe to the opaque track");
 		let mut group = subscriber.next_group().await.unwrap().expect("a group");
 		let frame = group.read_frame().await.unwrap().expect("a frame");
-		assert_eq!(
-			frame.payload.as_ref(),
-			b"stamped",
-			"only the stamped buffer was published"
+		assert_eq!(frame.payload.as_ref(), b"no pts", "the unstamped buffer was published");
+		assert_eq!(std::time::Duration::from(frame.timestamp).as_micros(), 25_000);
+	}
+
+	#[test]
+	fn an_unstamped_opaque_buffer_requires_a_current_running_time() {
+		gst::init().unwrap();
+		let (broadcast, catalog) = producers();
+		let mut pad = Pad::new();
+		pad.observe_caps(&broadcast, &catalog, &opaque_caps(), Some("audiolevels"));
+		pad.observe_segment(time_segment());
+
+		assert!(
+			pad.push_buffer(Bytes::from_static(b"no timestamp"), None, None)
+				.is_err(),
+			"the caller gets a hard error instead of a silent drop"
 		);
 	}
 
@@ -736,7 +774,8 @@ mod tests {
 		pad.observe_caps(&broadcast, &catalog, &gst::Caps::builder("video/x-raw").build(), None);
 		assert!(pad.is_failed());
 		pad.observe_segment(time_segment());
-		pad.push_buffer(Bytes::from_static(b"x"), Some(gst::ClockTime::ZERO));
+		pad.push_buffer(Bytes::from_static(b"x"), Some(gst::ClockTime::ZERO), None)
+			.unwrap();
 	}
 
 	// A real IDR AU emits a frame to the published track (not just a rendition off the SPS).
@@ -747,7 +786,8 @@ mod tests {
 		let mut pad = Pad::new();
 		pad.observe_caps(&broadcast, &catalog, &h264_caps(), None);
 		pad.observe_segment(time_segment());
-		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO));
+		pad.push_buffer(h264_keyframe_au(), Some(gst::ClockTime::ZERO), None)
+			.unwrap();
 
 		let snapshot = catalog.snapshot();
 		let track = snapshot.video.renditions.keys().next().expect("a video rendition");

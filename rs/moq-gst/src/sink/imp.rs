@@ -434,6 +434,7 @@ impl MoqSink {
 		// moq-net rejects it (FrameTooLarge) before reserving its own group slot, and that error invalidates
 		// just this pad.
 		let pts = buffer.pts();
+		let current_running_time = self.obj().current_running_time();
 		let map = buffer.map_readable().map_err(|_| {
 			gst::error!(CAT, "failed to map buffer on pad {}", pad.name());
 			gst::FlowError::Error
@@ -465,7 +466,15 @@ impl MoqSink {
 			return Ok(gst::FlowSuccess::Ok); // drop quietly; the pad already reported its failure
 		}
 
-		let no_segment = media.push_buffer(data, pts);
+		let no_segment = media.push_buffer(data, pts, current_running_time).map_err(|err| {
+			gst::element_error!(
+				self.obj(),
+				gst::StreamError::Format,
+				("could not timestamp buffer on pad {}", pad.name()),
+				["{err}"]
+			);
+			gst::FlowError::Error
+		})?;
 		drop(guard);
 		drop(activity);
 

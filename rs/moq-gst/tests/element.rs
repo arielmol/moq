@@ -267,10 +267,11 @@ fn unsupported_caps_are_refused_at_the_caps_event() {
 		pad.send_event(gst::event::Caps::new(&caps)),
 		"opaque data passes the same gate"
 	);
+	child.set_property("track", "other");
 	assert_eq!(
 		child.property::<String>("track"),
 		"audiolevels",
-		"the opaque pad reserved the track it was named for"
+		"the CAPS event committed the effective track and made it immutable"
 	);
 	let _ = sink.set_state(gst::State::Null);
 }
