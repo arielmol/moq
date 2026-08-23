@@ -197,6 +197,7 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::AudioConfig {
 /// Importers apply it to both the track writer and the `container` each catalog rendition
 /// advertises, so the catalog names what is on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum MediaContainer {
 	/// A VarInt timestamp prefix followed by the raw codec payload.
 	#[default]

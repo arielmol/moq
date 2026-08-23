@@ -17,7 +17,7 @@ use gst::subclass::prelude::*;
 use hang::moq_net;
 
 use super::MediaContainer;
-use super::pad::{Pad, caps_supported};
+use super::pad::{Pad, ProducerOptions, caps_supported};
 use super::request_pad::MoqSinkPad;
 use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session};
 
@@ -534,9 +534,13 @@ impl MoqSink {
 							..
 						} = state;
 						let catalog = catalog.as_ref()?;
+						let mut options = ProducerOptions::new(&caps).with_container(*container);
+						if let Some(track) = reservation.requested() {
+							options = options.with_track(track);
+						}
 						pads.entry(pad.name().to_string())
 							.or_insert_with(Pad::new)
-							.observe_caps(broadcast, catalog, *container, &caps, reservation.requested())
+							.observe_caps(broadcast, catalog, options)
 					})
 				};
 				if let Some(track) = reserved {

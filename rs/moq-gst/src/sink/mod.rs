@@ -13,6 +13,7 @@ pub use session::ConnectionStatus;
 /// The wire container used for media tracks published by `moqsink`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, glib::Enum)]
 #[enum_type(name = "GstMoqSinkMediaContainer")]
+#[non_exhaustive]
 pub enum MediaContainer {
 	/// Hang's original timestamp-prefixed media container.
 	#[default]
