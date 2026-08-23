@@ -271,9 +271,9 @@ gst-launch-1.0 -v -e \
 ```
 
 Such a pad requires `track`: an opaque track is advertised nowhere, so a generated name would be
-unreachable, and a pad without one is invalidated. It also requires a TIME segment: byte-oriented
-sources such as `filesrc` and `fdsrc` push a BYTES segment, and every buffer behind one is dropped
-with a single warning on the bus.
+unreachable, and a pad without one is invalidated. Its segments must use TIME format at rate `1.0`
+and must not rewind running time without a flush. Byte-oriented sources such as `filesrc` and `fdsrc`
+push a BYTES segment, and every buffer behind one is dropped with a single warning on the bus.
 
 Each accepted buffer becomes one group holding one frame, stamped with the buffer's PTS mapped through
 that segment. A buffer without a PTS uses the pipeline's current running time when available. If running
