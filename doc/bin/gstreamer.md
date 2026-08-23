@@ -253,18 +253,20 @@ gst-launch-1.0 -v -e \
     sink_0::track=camera sink_1::track=commentary
 ```
 
-Media tracks use the legacy Hang container by default. Set `container=loc` before starting the
-element to publish every media pad as Low Overhead Container and advertise LOC in the catalog:
+Media tracks use the legacy Hang container by default. Set a pad's `container=loc` before its CAPS
+event to publish that track as Low Overhead Container and advertise LOC in the catalog:
 
 ```bash
 gst-launch-1.0 -v -e \
   videotestsrc is-live=true ! x264enc tune=zerolatency ! h264parse \
     ! video/x-h264,stream-format=byte-stream,alignment=au ! mux.sink_0 \
-  moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang container=loc
+  moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang sink_0::container=loc
 ```
 
-`container` is writable in `NULL` and `READY`. It is fixed for a running publication and becomes
-writable again after returning to `READY`.
+Set the property on each media pad that should use LOC; other pads remain Legacy.
+
+Like `track`, `container` is writable in any state until the pad's CAPS event reserves the track.
+It is fixed for that producer and becomes writable again after returning to `READY`.
 
 `track` is writable in any state until the pad's CAPS event reserves the track, so a pad requested
 while the pipeline runs can still be named before its first buffer. From then on it reads back the
@@ -274,8 +276,8 @@ the generated name. A name another pad already holds invalidates only that pad, 
 broadcast keeps publishing.
 
 A pad negotiated as `application/octet-stream` publishes application data instead of media. The bytes
-go out exactly as they arrive: no codec, no media container, no interpretation. The element's
-`container` property does not apply to these pads.
+go out exactly as they arrive: no codec, no media container, no interpretation. A data pad's
+`container` property has no effect.
 
 ```bash
 gst-launch-1.0 -v -e \
