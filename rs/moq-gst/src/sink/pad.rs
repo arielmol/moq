@@ -434,6 +434,23 @@ fn signed_nanos(running_time: gst::Signed<gst::ClockTime>) -> Option<i64> {
 	}
 }
 
+/// A real Annex-B AU (SPS + PPS + IDR) so tests can resolve a rendition and publish a frame.
+#[cfg(test)]
+pub(super) fn h264_keyframe_au() -> Bytes {
+	let sps: &[u8] = &[
+		0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+		0x01, 0xd4, 0xc0, 0x80,
+	];
+	let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+	let idr: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x21];
+	let mut au = Vec::new();
+	for nal in [sps, pps, idr] {
+		au.extend_from_slice(&[0, 0, 0, 1]);
+		au.extend_from_slice(nal);
+	}
+	Bytes::from(au)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -462,22 +479,6 @@ mod tests {
 			Some(track) => options.with_track(track),
 			None => options,
 		}
-	}
-
-	/// A real Annex-B AU (SPS + PPS + IDR) so the importer publishes a rendition and a frame.
-	fn h264_keyframe_au() -> Bytes {
-		let sps: &[u8] = &[
-			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
-			0x01, 0xd4, 0xc0, 0x80,
-		];
-		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
-		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x21];
-		let mut au = Vec::new();
-		for nal in [sps, pps, idr] {
-			au.extend_from_slice(&[0, 0, 0, 1]);
-			au.extend_from_slice(nal);
-		}
-		Bytes::from(au)
 	}
 
 	fn time_segment() -> gst::Segment {

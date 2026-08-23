@@ -17,7 +17,6 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use hang::moq_net;
 
-use super::MediaContainer;
 use super::pad::{Pad, ProducerOptions, caps_supported};
 use super::request_pad::MoqSinkPad;
 use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session};
@@ -29,7 +28,6 @@ struct Settings {
 	tls_disable_verify: bool,
 	quic_idle_timeout: Option<Duration>,
 	quic_keep_alive: Option<Duration>,
-	container: MediaContainer,
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -61,7 +59,6 @@ struct State {
 	session: Session,
 	broadcast: moq_net::broadcast::Producer,
 	catalog: Option<moq_mux::catalog::Producer>,
-	container: moq_mux::catalog::MediaContainer,
 	pads: HashMap<String, Pad>,
 	ended: HashSet<String>,
 	eos_posted: bool,
@@ -159,12 +156,6 @@ impl ObjectImpl for MoqSink {
 					.default_value(quic.keep_alive.map(duration_millis).unwrap_or(0))
 					.mutable_ready()
 					.build(),
-				glib::ParamSpecEnum::builder::<MediaContainer>("container")
-					.nick("Media container")
-					.blurb("Wire container used for media tracks; opaque application tracks are unchanged")
-					.default_value(MediaContainer::Legacy)
-					.mutable_ready()
-					.build(),
 				// Read-only, served from the live session's status. Each notifies on change.
 				glib::ParamSpecEnum::builder::<ConnectionStatus>("status")
 					.nick("Connection status")
@@ -222,7 +213,6 @@ impl ObjectImpl for MoqSink {
 			"tls-disable-verify" => settings.tls_disable_verify = value.get().unwrap(),
 			"quic-idle-timeout" => settings.quic_idle_timeout = Some(Duration::from_millis(value.get().unwrap())),
 			"quic-keep-alive" => settings.quic_keep_alive = Some(Duration::from_millis(value.get().unwrap())),
-			"container" => settings.container = value.get().unwrap(),
 			_ => unreachable!(),
 		}
 	}
@@ -259,7 +249,6 @@ impl ObjectImpl for MoqSink {
 						.map(duration_millis)
 						.unwrap_or(0)
 						.to_value(),
-					"container" => settings.container.to_value(),
 					_ => unreachable!(),
 				}
 			}
@@ -431,9 +420,7 @@ impl ElementImpl for MoqSink {
 impl MoqSink {
 	/// Create the session and producers before any buffer flows.
 	fn start_session(&self) -> Result<(), gst::StateChangeError> {
-		let settings = self.settings.lock().unwrap().clone();
-		let container = settings.container.into();
-		let settings = ResolvedSettings::try_from(settings).map_err(|err| {
+		let settings = ResolvedSettings::try_from(self.settings.lock().unwrap().clone()).map_err(|err| {
 			gst::error!(CAT, obj = self.obj(), "invalid settings: {err:#}");
 			gst::StateChangeError
 		})?;
@@ -445,7 +432,6 @@ impl MoqSink {
 			session,
 			broadcast,
 			catalog: Some(catalog),
-			container,
 			pads: HashMap::new(),
 			ended: HashSet::new(),
 			eos_posted: false,
@@ -565,12 +551,11 @@ impl MoqSink {
 						let State {
 							broadcast,
 							catalog,
-							container,
 							pads,
 							..
 						} = state;
 						let catalog = catalog.as_ref()?;
-						let mut options = ProducerOptions::new(&caps).with_container(*container);
+						let mut options = ProducerOptions::new(&caps).with_container(reservation.container().into());
 						if let Some(track) = reservation.requested() {
 							options = options.with_track(track);
 						}
@@ -661,6 +646,7 @@ impl MoqSink {
 
 #[cfg(test)]
 mod tests {
+	use super::super::MediaContainer;
 	use super::*;
 
 	fn sink() -> super::super::MoqSink {
@@ -681,7 +667,6 @@ mod tests {
 			"tls-disable-verify",
 			"quic-idle-timeout",
 			"quic-keep-alive",
-			"container",
 		] {
 			assert!(
 				spec(&sink, name).flags().contains(gst::PARAM_FLAG_MUTABLE_READY),
@@ -737,20 +722,16 @@ mod tests {
 	fn a_started_element_keeps_its_startup_properties() {
 		gst::init().unwrap();
 		let sink = sink();
-		assert_eq!(sink.property::<MediaContainer>("container"), MediaContainer::Legacy);
 		sink.set_property("url", "https://127.0.0.1:1");
 		sink.set_property("broadcast", "before");
 		sink.set_property("quic-idle-timeout", 15_000u64);
 		sink.set_property("quic-keep-alive", 3_000u64);
-		sink.set_property("container", MediaContainer::Loc);
 		assert_eq!(sink.property::<String>("broadcast"), "before");
-		assert_eq!(sink.property::<MediaContainer>("container"), MediaContainer::Loc);
 
 		sink.set_state(gst::State::Paused).unwrap();
 		sink.set_property("broadcast", "after");
 		sink.set_property("quic-idle-timeout", 20_000u64);
 		sink.set_property("quic-keep-alive", 4_000u64);
-		sink.set_property("container", MediaContainer::Legacy);
 		assert_eq!(
 			sink.property::<String>("broadcast"),
 			"before",
@@ -758,18 +739,58 @@ mod tests {
 		);
 		assert_eq!(sink.property::<u64>("quic-idle-timeout"), 15_000);
 		assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
-		assert_eq!(sink.property::<MediaContainer>("container"), MediaContainer::Loc);
 
 		// MUTABLE_READY means configurable on every run, not just before the first.
 		sink.set_state(gst::State::Ready).unwrap();
 		sink.set_property("broadcast", "after");
 		sink.set_property("quic-idle-timeout", 20_000u64);
 		sink.set_property("quic-keep-alive", 4_000u64);
-		sink.set_property("container", MediaContainer::Legacy);
 		assert_eq!(sink.property::<String>("broadcast"), "after");
 		assert_eq!(sink.property::<u64>("quic-idle-timeout"), 20_000);
 		assert_eq!(sink.property::<u64>("quic-keep-alive"), 4_000);
-		assert_eq!(sink.property::<MediaContainer>("container"), MediaContainer::Legacy);
+		sink.set_state(gst::State::Null).unwrap();
+	}
+
+	#[test]
+	fn pad_containers_reach_the_catalog_through_caps() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "test");
+		let pad = sink.request_pad_simple("sink_0").unwrap();
+		pad.set_property("track", "camera");
+		pad.set_property("container", MediaContainer::Loc);
+		let legacy_pad = sink.request_pad_simple("sink_1").unwrap();
+		legacy_pad.set_property("track", "legacy");
+
+		sink.set_state(gst::State::Paused).unwrap();
+		let caps = gst::Caps::builder("video/x-h264")
+			.field("stream-format", "byte-stream")
+			.field("alignment", "au")
+			.build();
+		for (pad, stream) in [(&pad, "loc"), (&legacy_pad, "legacy")] {
+			assert!(pad.send_event(gst::event::StreamStart::new(stream)));
+			assert!(pad.send_event(gst::event::Caps::new(&caps)));
+			assert!(pad.send_event(gst::event::Segment::new(
+				&gst::FormattedSegment::<gst::ClockTime>::new(),
+			)));
+			let mut buffer = gst::Buffer::from_slice(super::super::pad::h264_keyframe_au());
+			buffer.get_mut().unwrap().set_pts(Some(gst::ClockTime::ZERO));
+			assert_eq!(pad.chain(buffer), Ok(gst::FlowSuccess::Ok));
+		}
+
+		let snapshot = {
+			let state = sink.imp().state.lock().unwrap();
+			state.as_ref().unwrap().catalog.as_ref().unwrap().snapshot()
+		};
+		assert_eq!(
+			snapshot.video.renditions.get("camera").unwrap().container,
+			hang::catalog::Container::Loc
+		);
+		assert_eq!(
+			snapshot.video.renditions.get("legacy").unwrap().container,
+			hang::catalog::Container::Legacy
+		);
 		sink.set_state(gst::State::Null).unwrap();
 	}
 }
