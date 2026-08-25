@@ -39,6 +39,7 @@ For `http://` URLs, `moq-native` automatically fetches the server's certificate 
 
 An idle timeout of `0` disables it locally.
 These values apply only to QUIC connections. WebSocket fallback uses its own heartbeat policy.
+The iroh backend applies the idle timeout but ignores keep-alive because it has no keep-alive setting.
 
 ```bash
 gst-launch-1.0 -e \

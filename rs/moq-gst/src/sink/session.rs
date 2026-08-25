@@ -105,6 +105,7 @@ pub struct ResolvedSettings {
 	pub quic_keep_alive: Option<std::time::Duration>,
 }
 
+/// Builds the native client configuration with the sink's TLS, QUIC, and backoff overrides.
 pub(super) fn client_config(settings: &ResolvedSettings) -> moq_native::ClientConfig {
 	let mut config = moq_native::ClientConfig::default();
 	config.tls.disable_verify = Some(settings.tls_disable_verify);
