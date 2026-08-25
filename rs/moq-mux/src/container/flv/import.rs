@@ -504,18 +504,19 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 
 		let net_track = self.replace_video(track_id)?;
-		self.catalog
-			.lock()
-			.video
-			.renditions
-			.insert(net_track.name().to_string(), config.clone());
+		let name = net_track.name().to_string();
+		// Build the wire producer before advertising the rendition. Both steps are fallible (an
+		// unsupported container, a colliding timeline track), and a rendition published for a track
+		// we then fail to produce would be advertised to consumers but never served.
 		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
+		let media = self.catalog.media_producer(net_track, wire)?;
+		self.catalog.lock().video.renditions.insert(name, config.clone());
 		self.video.insert(
 			track_id,
 			VideoStream {
 				// Leading deltas before the first keyframe are skipped at the write
 				// site (the producer reports MissingKeyframe), so a mid-GOP join works.
-				track: self.catalog.media_producer(net_track, wire)?,
+				track: media,
 				config,
 			},
 		);
@@ -530,19 +531,14 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 
 		let net_track = self.replace_audio(track_id)?;
-		self.catalog
-			.lock()
-			.audio
-			.renditions
-			.insert(net_track.name().to_string(), config.clone());
+		let name = net_track.name().to_string();
+		// Build the wire producer before advertising the rendition. Both steps are fallible (an
+		// unsupported container, a colliding timeline track), and a rendition published for a track
+		// we then fail to produce would be advertised to consumers but never served.
 		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
-		self.audio.insert(
-			track_id,
-			AudioStream {
-				track: self.catalog.media_producer(net_track, wire)?,
-				config,
-			},
-		);
+		let media = self.catalog.media_producer(net_track, wire)?;
+		self.catalog.lock().audio.renditions.insert(name, config.clone());
+		self.audio.insert(track_id, AudioStream { track: media, config });
 		Ok(())
 	}
 
