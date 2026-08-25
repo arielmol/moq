@@ -24,7 +24,7 @@ pub enum MediaContainer {
 	Loc,
 }
 
-impl From<MediaContainer> for moq_mux::catalog::MediaContainer {
+impl From<MediaContainer> for hang::catalog::Container {
 	fn from(container: MediaContainer) -> Self {
 		match container {
 			MediaContainer::Legacy => Self::Legacy,

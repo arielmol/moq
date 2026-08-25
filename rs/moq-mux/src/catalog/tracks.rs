@@ -192,38 +192,6 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::AudioConfig {
 	}
 }
 
-/// The Legacy or LOC wrapper selected for elementary codec payloads.
-///
-/// Importers apply it to both the track writer and the `container` each catalog rendition
-/// advertises, so the catalog names what is on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum MediaContainer {
-	/// A VarInt timestamp prefix followed by the raw codec payload.
-	#[default]
-	Legacy,
-	/// Low Overhead Container: one LOC frame per moq frame.
-	Loc,
-}
-
-impl From<MediaContainer> for hang::catalog::Container {
-	fn from(container: MediaContainer) -> Self {
-		match container {
-			MediaContainer::Legacy => Self::Legacy,
-			MediaContainer::Loc => Self::Loc,
-		}
-	}
-}
-
-impl From<MediaContainer> for super::hang::Container {
-	fn from(container: MediaContainer) -> Self {
-		match container {
-			MediaContainer::Legacy => Self::Legacy,
-			MediaContainer::Loc => Self::Loc,
-		}
-	}
-}
-
 /// A clonable reservation context handed to importers so they declare their tracks up front.
 ///
 /// Made via [`Producer::reserve`]. While any `Reserved` clone is alive the track set may still
@@ -234,7 +202,7 @@ impl From<MediaContainer> for super::hang::Container {
 /// track list, so a one-shot muxer (fMP4, MPEG-TS) never sees a half-converged catalog.
 pub struct Reserved<E: CatalogExt = ()> {
 	catalog: Producer<E>,
-	container: MediaContainer,
+	container: hang::catalog::Container,
 }
 
 impl<E: CatalogExt> Reserved<E> {
@@ -242,23 +210,36 @@ impl<E: CatalogExt> Reserved<E> {
 		catalog.add_reserver();
 		Self {
 			catalog,
-			container: MediaContainer::default(),
+			container: hang::catalog::Container::default(),
 		}
 	}
 
-	/// Select the Legacy or LOC wrapper used by importers that publish elementary codec payloads.
+	/// Select the container used by importers that publish elementary codec payloads.
 	///
-	/// Legacy unless selected. Passthrough importers such as fMP4 retain their native CMAF container.
-	pub fn with_container(mut self, container: MediaContainer) -> Self {
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. Passthrough importers such as
+	/// fMP4 retain their native CMAF container.
+	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
 		self.container = container;
 		self
 	}
 
-	/// The selected elementary-payload wrapper.
+	/// The selected container, to stamp on the rendition config an importer publishes.
 	///
 	/// See [`Reserved::with_container`].
-	pub fn container(&self) -> MediaContainer {
-		self.container
+	pub fn container(&self) -> &hang::catalog::Container {
+		&self.container
+	}
+
+	/// A media track writer using the selected container.
+	///
+	/// Shorthand for [`Producer::media_producer`](super::Producer::media_producer), so a track's
+	/// wire format cannot disagree with what its rendition advertises. Errors if this build cannot
+	/// write the selected container.
+	pub fn media_producer(
+		&self,
+		track: moq_net::track::Producer,
+	) -> crate::Result<crate::container::Producer<super::hang::Container>> {
+		self.catalog.media_producer(track, (&self.container).try_into()?)
 	}
 
 	/// Track properties for a media track under this catalog, carrying any retention it declares.
@@ -306,7 +287,7 @@ impl<E: CatalogExt> Clone for Reserved<E> {
 		self.catalog.add_reserver();
 		Self {
 			catalog: self.catalog.clone(),
-			container: self.container,
+			container: self.container.clone(),
 		}
 	}
 }
@@ -485,10 +466,10 @@ mod tests {
 	fn a_reservation_defaults_to_legacy_and_its_clones_keep_loc() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let catalog = super::super::Producer::new(&mut broadcast).unwrap();
-		assert_eq!(catalog.reserve().container(), MediaContainer::Legacy);
+		assert_eq!(catalog.reserve().container(), &hang::catalog::Container::Legacy);
 
-		let reserved = catalog.reserve().with_container(MediaContainer::Loc);
-		assert_eq!(reserved.clone().container(), MediaContainer::Loc);
+		let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
+		assert_eq!(reserved.clone().container(), &hang::catalog::Container::Loc);
 	}
 
 	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window, as a

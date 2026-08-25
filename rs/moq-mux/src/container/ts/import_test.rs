@@ -51,7 +51,7 @@ async fn public_container_preserves_loc_for_ts() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let reserved = catalog.reserve().with_container(crate::catalog::MediaContainer::Loc);
+	let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
 	let mut import = crate::import::Container::new(broadcast, reserved, "ts", data).unwrap();
 	import.finish().unwrap();
 

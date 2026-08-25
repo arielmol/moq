@@ -83,7 +83,7 @@ fn public_container_keeps_cmaf_when_loc_is_selected() {
 	let init = &data[..cursor.position() as usize];
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let reserved = catalog.reserve().with_container(crate::catalog::MediaContainer::Loc);
+	let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
 	let mut import = crate::import::Container::new(broadcast, reserved, "fmp4", init).unwrap();
 	import.finish().unwrap();
 

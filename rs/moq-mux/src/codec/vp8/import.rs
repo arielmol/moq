@@ -34,7 +34,7 @@ impl<E: CatalogExt> Import<E> {
 		let rendition = reserved.video(track.name());
 		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
 		let mut import = Self {
-			track: reserved.producer().media_producer(track, reserved.container().into())?,
+			track: reserved.media_producer(track)?,
 			rendition,
 			catalog,
 		};
@@ -186,7 +186,7 @@ mod tests {
 	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {
 		let (track, catalog) = setup();
 		let subscriber = track.subscribe(None);
-		let reserved = catalog.reserve().with_container(crate::catalog::MediaContainer::Loc);
+		let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
 		let hint = crate::catalog::VideoHint {
 			codec: Some(hang::catalog::VideoCodec::VP8),
 			..Default::default()

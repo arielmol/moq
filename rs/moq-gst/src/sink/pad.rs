@@ -35,7 +35,7 @@ enum Producer {
 
 /// Inputs used to build a producer after a pad observes caps.
 pub(super) struct ProducerOptions<'a> {
-	container: moq_mux::catalog::MediaContainer,
+	container: hang::catalog::Container,
 	caps: &'a gst::Caps,
 	requested: Option<&'a str>,
 }
@@ -43,13 +43,13 @@ pub(super) struct ProducerOptions<'a> {
 impl<'a> ProducerOptions<'a> {
 	pub(super) fn new(caps: &'a gst::Caps) -> Self {
 		Self {
-			container: moq_mux::catalog::MediaContainer::default(),
+			container: hang::catalog::Container::default(),
 			caps,
 			requested: None,
 		}
 	}
 
-	pub(super) fn with_container(mut self, container: moq_mux::catalog::MediaContainer) -> Self {
+	pub(super) fn with_container(mut self, container: hang::catalog::Container) -> Self {
 		self.container = container;
 		self
 	}
@@ -702,7 +702,7 @@ mod tests {
 				&broadcast,
 				&catalog,
 				ProducerOptions::new(&opaque_caps())
-					.with_container(moq_mux::catalog::MediaContainer::Loc)
+					.with_container(hang::catalog::Container::Loc)
 					.with_track("audiolevels"),
 			),
 			Some("audiolevels".to_string())
@@ -763,7 +763,7 @@ mod tests {
 				&broadcast,
 				&catalog,
 				ProducerOptions::new(&h264_caps())
-					.with_container(moq_mux::catalog::MediaContainer::Loc)
+					.with_container(hang::catalog::Container::Loc)
 					.with_track("camera"),
 			),
 			Some("camera".to_string())

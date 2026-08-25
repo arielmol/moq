@@ -134,7 +134,7 @@ impl<E: CatalogExt> Import<E> {
 	) -> crate::Result<Self> {
 		let mut audio_config =
 			hang::catalog::AudioConfig::new(descriptor.codec.clone(), config.sample_rate, config.channel_count);
-		audio_config.container = reserved.container().into();
+		audio_config.container = reserved.container().clone();
 		// description stays None: legacy frames are self-describing and no in-repo
 		// consumer needs out-of-band config (TS export self-describes; WebCodecs
 		// cannot decode these codecs). Fill it only if a real consumer ever needs it.
@@ -147,7 +147,7 @@ impl<E: CatalogExt> Import<E> {
 		rendition.set(audio_config);
 
 		Ok(Self {
-			track: reserved.producer().media_producer(track, reserved.container().into())?,
+			track: reserved.media_producer(track)?,
 			rendition,
 		})
 	}

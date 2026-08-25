@@ -61,7 +61,7 @@ const MAX_DATA_OFFSET: usize = 64 * 1024;
 pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
-	container: crate::catalog::MediaContainer,
+	container: hang::catalog::Container,
 
 	/// Held until the first media frame, by which point all sequence headers (hence renditions) have
 	/// been declared, so the catalog is withheld until the track set is known (and, when composed with
@@ -97,7 +97,7 @@ struct AudioStream {
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Create a demuxer publishing into `broadcast` with renditions announced on `catalog`.
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
-		let container = reserved.container();
+		let container = reserved.container().clone();
 		Self {
 			broadcast,
 			catalog: reserved.producer(),
@@ -489,7 +489,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// (Re)build the video track `track_id` for `config`, unless it matches the current one.
 	fn init_video(&mut self, track_id: u8, mut config: VideoConfig) -> anyhow::Result<()> {
-		config.container = self.container.into();
+		config.container = self.container.clone();
 		if self.video.get(&track_id).is_some_and(|s| s.config == config) {
 			return Ok(());
 		}
@@ -500,12 +500,13 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			.video
 			.renditions
 			.insert(net_track.name().to_string(), config.clone());
+		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
 		self.video.insert(
 			track_id,
 			VideoStream {
 				// Leading deltas before the first keyframe are skipped at the write
 				// site (the producer reports MissingKeyframe), so a mid-GOP join works.
-				track: self.catalog.media_producer(net_track, self.container.into())?,
+				track: self.catalog.media_producer(net_track, wire)?,
 				config,
 			},
 		);
@@ -514,7 +515,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// (Re)build the audio track `track_id` for `config`, unless it matches the current one.
 	fn init_audio(&mut self, track_id: u8, mut config: AudioConfig) -> anyhow::Result<()> {
-		config.container = self.container.into();
+		config.container = self.container.clone();
 		if self.audio.get(&track_id).is_some_and(|s| s.config == config) {
 			return Ok(());
 		}
@@ -525,10 +526,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			.audio
 			.renditions
 			.insert(net_track.name().to_string(), config.clone());
+		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
 		self.audio.insert(
 			track_id,
 			AudioStream {
-				track: self.catalog.media_producer(net_track, self.container.into())?,
+				track: self.catalog.media_producer(net_track, wire)?,
 				config,
 			},
 		);

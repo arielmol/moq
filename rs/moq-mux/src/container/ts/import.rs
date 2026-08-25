@@ -44,12 +44,12 @@ use moq_net::Timestamp;
 /// are intercepted before the reader and reassembled. With a base `Catalog<()>`
 /// they're logged and dropped instead.
 ///
-/// Selecting LOC applies only to decoded media renditions. Verbatim tracks in the
+/// The selected container applies only to decoded media renditions. Verbatim tracks in the
 /// `mpegts` catalog section continue to use the legacy Hang container.
 pub struct Import<E: catalog::Catalog = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
-	container: crate::catalog::MediaContainer,
+	container: hang::catalog::Container,
 
 	/// Held while the first PMT is parsed so the catalog is withheld from the broadcast until every
 	/// stream in the initial program has reserved its rendition. Dropped once the PMT is fully
@@ -128,7 +128,7 @@ pub struct Import<E: catalog::Catalog = ()> {
 impl<E: catalog::Catalog> Import<E> {
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
 		let feed = Feed::default();
-		let container = reserved.container();
+		let container = reserved.container().clone();
 		// A long-lived producer handle for catalog edits (mpegts sections, later PMTs); the passed
 		// reservation gates the initial publish and is dropped once the first PMT is parsed.
 		let catalog = reserved.producer();
@@ -165,7 +165,7 @@ impl<E: catalog::Catalog> Import<E> {
 	}
 
 	fn reserve(&self) -> crate::catalog::Reserved<E> {
-		self.catalog.reserve().with_container(self.container)
+		self.catalog.reserve().with_container(self.container.clone())
 	}
 
 	/// Append `buf` to the internal scratch and demux every whole TS packet it

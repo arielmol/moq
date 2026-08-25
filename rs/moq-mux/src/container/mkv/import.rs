@@ -41,7 +41,7 @@ const DEFAULT_TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
-	container: crate::catalog::MediaContainer,
+	container: hang::catalog::Container,
 
 	/// Held until the Tracks element is processed, so the catalog is withheld from the broadcast
 	/// until every rendition is in (and, when composed with other importers, until they finish too).
@@ -78,7 +78,7 @@ struct MkvTrack {
 
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
-		let container = reserved.container();
+		let container = reserved.container().clone();
 		Self {
 			broadcast,
 			catalog: reserved.producer(),
@@ -281,7 +281,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		// Build the media producer before publishing the rendition. It is fallible (its
 		// timeline track can collide), and a rendition published for a track we then fail
 		// to produce would be advertised to consumers but never served.
-		let media = self.catalog.media_producer(track, self.container.into())?;
+		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
+		let media = self.catalog.media_producer(track, wire)?;
 
 		let mut catalog = self.catalog.clone();
 		let mut catalog = catalog.lock();
@@ -289,12 +290,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		match kind {
 			TrackKind::Video => {
 				let mut config = build_video_config(&codec_id, codec_private.as_ref(), video_children.as_deref())?;
-				config.container = self.container.into();
+				config.container = self.container.clone();
 				catalog.video.renditions.insert(name, config);
 			}
 			TrackKind::Audio => {
 				let mut config = build_audio_config(&codec_id, codec_private.as_ref(), audio_children.as_deref())?;
-				config.container = self.container.into();
+				config.container = self.container.clone();
 				catalog.audio.renditions.insert(name, config);
 			}
 		}
