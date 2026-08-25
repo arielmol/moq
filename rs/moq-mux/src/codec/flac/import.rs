@@ -33,11 +33,13 @@ impl<E: CatalogExt> Import<E> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
 		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
 		config.timeline = Some(reserved.producer().timeline(track.name())?.section());
-		config.container = reserved.container().clone();
+		// The caller's config names the container; the writer is built from that same value so the
+		// wire cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
 		let mut rendition = reserved.audio(track.name());
 		rendition.set(config);
 		Ok(Self {
-			track: reserved.media_producer(track)?,
+			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 		})
 	}

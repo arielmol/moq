@@ -32,9 +32,12 @@ impl<E: CatalogExt> Import<E> {
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
 		let rendition = reserved.video(track.name());
+		// The hint names the container; the writer is built from that same value so the wire
+		// cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
 		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
 		let mut import = Self {
-			track: reserved.media_producer(track)?,
+			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 			catalog,
 		};
@@ -186,9 +189,10 @@ mod tests {
 	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {
 		let (track, catalog) = setup();
 		let subscriber = track.subscribe(None);
-		let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
+		let reserved = catalog.reserve();
 		let hint = crate::catalog::VideoHint {
 			codec: Some(hang::catalog::VideoCodec::VP8),
+			container: hang::catalog::Container::Loc,
 			..Default::default()
 		};
 		let mut import = super::Import::new(track, reserved, hint).unwrap();

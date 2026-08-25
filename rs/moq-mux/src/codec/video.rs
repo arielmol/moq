@@ -22,9 +22,6 @@ pub(crate) struct Catalog {
 	timeline: hang::catalog::Timeline,
 	/// The last config published, so an unchanged re-resolve doesn't re-mirror the rendition.
 	last: Option<hang::catalog::VideoConfig>,
-	/// The wire container the reservation selected, stamped on every config so the catalog names
-	/// what the track writer produces.
-	container: hang::catalog::Container,
 }
 
 impl Catalog {
@@ -34,7 +31,6 @@ impl Catalog {
 			timeline: reserved.producer().timeline(name)?.section(),
 			hint,
 			last: None,
-			container: reserved.container().clone(),
 		})
 	}
 
@@ -60,7 +56,6 @@ impl Catalog {
 	) {
 		self.hint.apply(&mut config);
 		config.timeline = Some(self.timeline.clone());
-		config.container = self.container.clone();
 		if self.last.as_ref() == Some(&config) {
 			return;
 		}

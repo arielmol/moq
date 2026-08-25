@@ -33,11 +33,13 @@ impl<E: CatalogExt> Import<E> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
 		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
 		config.timeline = Some(reserved.producer().timeline(track.name())?.section());
-		config.container = reserved.container().clone();
+		// The caller's config names the container; the writer is built from that same value so the
+		// wire cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
 		let mut rendition = reserved.audio(track.name());
 		rendition.set(config);
 		Ok(Self {
-			track: reserved.media_producer(track)?,
+			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 		})
 	}
@@ -147,9 +149,11 @@ mod tests {
 		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
 		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
 		let subscriber = track.subscribe(None);
-		let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
+		let reserved = catalog.reserve();
 		let config = crate::codec::opus::Config::new(48_000, 2);
-		let mut import = super::Import::new(track, reserved, config.into()).unwrap();
+		let mut config: hang::catalog::AudioConfig = config.into();
+		config.container = hang::catalog::Container::Loc;
+		let mut import = super::Import::new(track, reserved, config).unwrap();
 
 		let audio = catalog.snapshot().audio.renditions.get("audio").cloned().unwrap();
 		assert_eq!(audio.container, hang::catalog::Container::Loc);

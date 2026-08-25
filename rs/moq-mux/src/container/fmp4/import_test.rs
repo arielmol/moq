@@ -74,8 +74,11 @@ fn test_bbb_catalog() {
 	assert!(matches!(audio.container, Container::Cmaf { .. }));
 }
 
+/// fMP4 is passthrough: it republishes the fragments its source already produced, so it exposes no
+/// container selection (unlike the demuxers, which decode to elementary payloads) and every
+/// rendition it publishes carries the CMAF init it parsed.
 #[test]
-fn public_container_keeps_cmaf_when_loc_is_selected() {
+fn every_rendition_is_cmaf() {
 	let data = include_bytes!("test_data/bbb.mp4");
 	let mut cursor = std::io::Cursor::new(data.as_slice());
 	mp4_atom::Ftyp::decode(&mut cursor).unwrap();
@@ -83,8 +86,8 @@ fn public_container_keeps_cmaf_when_loc_is_selected() {
 	let init = &data[..cursor.position() as usize];
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
-	let mut import = crate::import::Container::new(broadcast, reserved, "fmp4", init).unwrap();
+	let mut import = super::Import::new(broadcast, catalog.reserve());
+	import.decode(init).unwrap();
 	import.finish().unwrap();
 
 	let snapshot = catalog.snapshot();

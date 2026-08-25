@@ -110,6 +110,7 @@ pub(crate) struct Descriptor {
 pub(crate) struct Config {
 	pub sample_rate: u32,
 	pub channel_count: u32,
+	pub container: hang::catalog::Container,
 }
 
 /// Legacy audio importer.
@@ -134,7 +135,7 @@ impl<E: CatalogExt> Import<E> {
 	) -> crate::Result<Self> {
 		let mut audio_config =
 			hang::catalog::AudioConfig::new(descriptor.codec.clone(), config.sample_rate, config.channel_count);
-		audio_config.container = reserved.container().clone();
+		audio_config.container = config.container.clone();
 		// description stays None: legacy frames are self-describing and no in-repo
 		// consumer needs out-of-band config (TS export self-describes; WebCodecs
 		// cannot decode these codecs). Fill it only if a real consumer ever needs it.
@@ -143,11 +144,12 @@ impl<E: CatalogExt> Import<E> {
 
 		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
 		audio_config.timeline = Some(reserved.producer().timeline(track.name())?.section());
+		let wire = crate::catalog::hang::Container::try_from(&audio_config.container)?;
 		let mut rendition = reserved.audio(track.name());
 		rendition.set(audio_config);
 
 		Ok(Self {
-			track: reserved.media_producer(track)?,
+			track: reserved.producer().media_producer(track, wire)?,
 			rendition,
 		})
 	}

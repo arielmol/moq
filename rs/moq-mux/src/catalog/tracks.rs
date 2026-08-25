@@ -114,6 +114,11 @@ pub struct VideoHint {
 	pub optimize_for_latency: Option<bool>,
 	/// The maximum jitter before the next frame is emitted.
 	pub jitter: Option<Duration>,
+	/// The container wrapping each frame on the wire.
+	///
+	/// Unlike the other fields this is a choice, not a hint: the bitstream never reveals a
+	/// container, so it is applied to every config the importer publishes rather than filling a gap.
+	pub container: hang::catalog::Container,
 }
 
 /// Fill `slot` from `value` only when the slot is still empty, so a value the stream detected always
@@ -140,6 +145,7 @@ impl VideoHint {
 		fill(&mut config.framerate, self.framerate);
 		fill(&mut config.optimize_for_latency, self.optimize_for_latency);
 		fill(&mut config.jitter, self.jitter);
+		config.container = self.container.clone();
 	}
 
 	/// Build a config from these fields alone, or `None` if the codec is missing. Used to publish
@@ -202,44 +208,12 @@ impl<E: CatalogExt> RenditionConfig<E> for hang::catalog::AudioConfig {
 /// track list, so a one-shot muxer (fMP4, MPEG-TS) never sees a half-converged catalog.
 pub struct Reserved<E: CatalogExt = ()> {
 	catalog: Producer<E>,
-	container: hang::catalog::Container,
 }
 
 impl<E: CatalogExt> Reserved<E> {
 	pub(super) fn new(catalog: Producer<E>) -> Self {
 		catalog.add_reserver();
-		Self {
-			catalog,
-			container: hang::catalog::Container::default(),
-		}
-	}
-
-	/// Select the container used by importers that publish elementary codec payloads.
-	///
-	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. Passthrough importers such as
-	/// fMP4 retain their native CMAF container.
-	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
-		self.container = container;
-		self
-	}
-
-	/// The selected container, to stamp on the rendition config an importer publishes.
-	///
-	/// See [`Reserved::with_container`].
-	pub fn container(&self) -> &hang::catalog::Container {
-		&self.container
-	}
-
-	/// A media track writer using the selected container.
-	///
-	/// Shorthand for [`Producer::media_producer`](super::Producer::media_producer), so a track's
-	/// wire format cannot disagree with what its rendition advertises. Errors if this build cannot
-	/// write the selected container.
-	pub fn media_producer(
-		&self,
-		track: moq_net::track::Producer,
-	) -> crate::Result<crate::container::Producer<super::hang::Container>> {
-		self.catalog.media_producer(track, (&self.container).try_into()?)
+		Self { catalog }
 	}
 
 	/// Track properties for a media track under this catalog, carrying any retention it declares.
@@ -287,7 +261,6 @@ impl<E: CatalogExt> Clone for Reserved<E> {
 		self.catalog.add_reserver();
 		Self {
 			catalog: self.catalog.clone(),
-			container: self.container.clone(),
 		}
 	}
 }
@@ -463,13 +436,17 @@ mod tests {
 
 	// Legacy unless selected, and a clone (what an importer is handed) carries the selection.
 	#[test]
-	fn a_reservation_defaults_to_legacy_and_its_clones_keep_loc() {
-		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = super::super::Producer::new(&mut broadcast).unwrap();
-		assert_eq!(catalog.reserve().container(), &hang::catalog::Container::Legacy);
+	fn a_video_hint_applies_its_container_to_every_config() {
+		let mut config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
+		VideoHint::default().apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Legacy);
 
-		let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
-		assert_eq!(reserved.clone().container(), &hang::catalog::Container::Loc);
+		let hint = VideoHint {
+			container: hang::catalog::Container::Loc,
+			..Default::default()
+		};
+		hint.apply(&mut config);
+		assert_eq!(config.container, hang::catalog::Container::Loc);
 	}
 
 	/// Feed ~40ms 100 kB frames (one per group) over more than the bitrate window, as a

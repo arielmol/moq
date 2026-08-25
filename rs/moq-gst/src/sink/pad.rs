@@ -147,18 +147,58 @@ impl Pad {
 			return Ok(name);
 		}
 		let mut broadcast = broadcast.clone();
-		let reserved = catalog.reserve().with_container(container);
+		let reserved = catalog.reserve();
 		// Every codec converges on one import::Track; only the caps -> importer construction differs. The
 		// pad template fixes the structural fields (h264/h265 byte-stream/au, AAC mpegversion=4/stream-format=raw),
 		// so negotiation rejects non-conforming caps before they reach here; only fields the template can't
 		// pin (the AAC codec_data) are checked below. The importer reserves the pad's track, which it
 		// accepts (setting the timescale) inside `Track::new`.
 		let (track, name): (import::Track, String) = match structure.name().as_str() {
-			"video/x-h264" => Self::reserve(&mut broadcast, reserved, requested, ".avc3", "avc3", &[])?,
-			"video/x-h265" => Self::reserve(&mut broadcast, reserved, requested, ".hev1", "hev1", &[])?,
-			"video/x-av1" => Self::reserve(&mut broadcast, reserved, requested, ".av01", "av01", &[])?,
-			"video/x-vp8" => Self::reserve(&mut broadcast, reserved, requested, ".vp8", "vp8", &[])?,
-			"video/x-vp9" => Self::reserve(&mut broadcast, reserved, requested, ".vp9", "vp9", &[])?,
+			"video/x-h264" => Self::reserve(
+				&mut broadcast,
+				reserved,
+				requested,
+				".avc3",
+				"avc3",
+				&[],
+				container.clone(),
+			)?,
+			"video/x-h265" => Self::reserve(
+				&mut broadcast,
+				reserved,
+				requested,
+				".hev1",
+				"hev1",
+				&[],
+				container.clone(),
+			)?,
+			"video/x-av1" => Self::reserve(
+				&mut broadcast,
+				reserved,
+				requested,
+				".av01",
+				"av01",
+				&[],
+				container.clone(),
+			)?,
+			"video/x-vp8" => Self::reserve(
+				&mut broadcast,
+				reserved,
+				requested,
+				".vp8",
+				"vp8",
+				&[],
+				container.clone(),
+			)?,
+			"video/x-vp9" => Self::reserve(
+				&mut broadcast,
+				reserved,
+				requested,
+				".vp9",
+				"vp9",
+				&[],
+				container.clone(),
+			)?,
 			// MP3: no config blob to parse (the config lives in each frame header), so the importer is
 			// built straight from the caps rate/channels. Keyed on `layer == 3`, which positively
 			// identifies Layer III: AAC (`audio/mpeg`, no layer field) and MP2 (`layer=2`) fall through
@@ -178,7 +218,12 @@ impl Pad {
 				let request = broadcast.reserve_track(name.clone())?;
 				let producer = request.accept(hang::container::track_info());
 				(
-					moq_mux::codec::mp3::Import::new(producer, reserved, config.into())?.into(),
+					moq_mux::codec::mp3::Import::new(
+						producer,
+						reserved,
+						Self::audio_config(config.into(), &container),
+					)?
+					.into(),
 					name,
 				)
 			}
@@ -188,7 +233,15 @@ impl Pad {
 					.get::<gst::Buffer>("codec_data")
 					.context("AAC caps missing codec_data")?;
 				let map = codec_data.map_readable().context("failed to map AAC codec_data")?;
-				Self::reserve(&mut broadcast, reserved, requested, ".aac", "aac", map.as_slice())?
+				Self::reserve(
+					&mut broadcast,
+					reserved,
+					requested,
+					".aac",
+					"aac",
+					map.as_slice(),
+					container.clone(),
+				)?
 			}
 			"audio/x-opus" => {
 				// Opus: GStreamer carries channels/rate in caps (not an OpusHead), and valid Opus caps
@@ -209,7 +262,12 @@ impl Pad {
 				let request = broadcast.reserve_track(name.clone())?;
 				let producer = request.accept(hang::container::track_info());
 				(
-					moq_mux::codec::opus::Import::new(producer, reserved, config.into())?.into(),
+					moq_mux::codec::opus::Import::new(
+						producer,
+						reserved,
+						Self::audio_config(config.into(), &container),
+					)?
+					.into(),
 					name,
 				)
 			}
@@ -237,13 +295,21 @@ impl Pad {
 		suffix: &str,
 		format: &str,
 		init: &[u8],
+		container: hang::catalog::Container,
 	) -> Result<(import::Track, String)> {
 		let name = Self::track_name(broadcast, requested, suffix);
 		let request = broadcast.reserve_track(name.clone())?;
-		Ok((
-			import::Track::new(request, reserved, import::Init::new(format, init.to_vec()))?,
-			name,
-		))
+		let init = import::Init::new(format, init.to_vec()).with_container(container);
+		Ok((import::Track::new(request, reserved, init)?, name))
+	}
+
+	/// Stamp the pad's container onto an audio config built from caps.
+	fn audio_config(
+		mut config: hang::catalog::AudioConfig,
+		container: &hang::catalog::Container,
+	) -> hang::catalog::AudioConfig {
+		config.container = container.clone();
+		config
 	}
 
 	/// Drops the producer (closing its track) and marks the pad failed so further buffers are dropped.

@@ -78,7 +78,7 @@ struct MkvTrack {
 
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
-		let container = reserved.container().clone();
+		let container = hang::catalog::Container::default();
 		Self {
 			broadcast,
 			catalog: reserved.producer(),
@@ -90,6 +90,15 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			cluster_timestamp: 0,
 			tracks: HashMap::default(),
 		}
+	}
+
+	/// Select the container this importer wraps decoded media renditions in.
+	///
+	/// [`Legacy`](hang::catalog::Container::Legacy) unless selected. It applies to every rendition
+	/// this input demuxes, since the tracks are discovered rather than named by the caller.
+	pub fn with_container(mut self, container: hang::catalog::Container) -> Self {
+		self.container = container;
+		self
 	}
 
 	/// Append the buffer to the internal scratch and parse as many tags as possible.

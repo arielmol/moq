@@ -141,8 +141,9 @@ async fn public_container_preserves_loc_for_flv() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let reserved = catalog.reserve().with_container(hang::catalog::Container::Loc);
-	let mut import = crate::import::Container::new(broadcast, reserved, "flv", &data).unwrap();
+	let reserved = catalog.reserve();
+	let mut import = super::Import::new(broadcast, reserved).with_container(hang::catalog::Container::Loc);
+	import.decode(&data).unwrap();
 	import.finish().unwrap();
 
 	let snapshot = catalog.snapshot();
