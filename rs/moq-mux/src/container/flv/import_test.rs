@@ -86,6 +86,47 @@ fn synth_flv() -> Vec<u8> {
 	out
 }
 
+/// A rendition must never be advertised when its media producer could not be built.
+///
+/// `media_producer` is fallible (it mints the rendition's `<name>.timeline.z` track, which can
+/// collide), so publishing the catalog entry first would leave consumers a rendition that is
+/// announced but has no producer behind it and is therefore never served.
+#[tokio::test(start_paused = true)]
+async fn rendition_is_not_published_when_the_media_producer_fails() {
+	let data = synth_flv();
+
+	// Control: the same fixture publishes a video rendition when nothing collides, so the
+	// assertion below cannot pass merely because the fixture stopped reaching track import.
+	{
+		let mut producer = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut producer).unwrap();
+		let mut importer = Import::new(producer, catalog.reserve());
+		importer.decode(&bytes::BytesMut::from(data.as_slice())).unwrap();
+		assert_eq!(
+			catalog.snapshot().video.renditions.len(),
+			1,
+			"fixture must publish a rendition"
+		);
+	}
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+
+	// Squat the timeline track the video rendition will want, so building its media producer
+	// fails. `unique_name` is deterministic, so this is the name it will pick. The handle must
+	// stay alive: the broadcast tracks names weakly, so dropping it frees the name.
+	let _squat = broadcast.create_track("0.flv-v.timeline.z", None).unwrap();
+
+	let mut importer = Import::new(broadcast, catalog.reserve());
+	// A track it cannot build surfaces in the catalog rather than in this result.
+	let _ = importer.decode(&bytes::BytesMut::from(data.as_slice()));
+
+	assert!(
+		catalog.snapshot().video.renditions.is_empty(),
+		"a rendition whose media producer failed must not be advertised"
+	);
+}
+
 #[tokio::test(start_paused = true)]
 async fn import_populates_catalog() {
 	let mut producer = moq_net::broadcast::Info::new().produce();
