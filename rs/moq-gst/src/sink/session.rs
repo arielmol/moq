@@ -130,6 +130,22 @@ pub(super) fn client_config(settings: &ResolvedSettings) -> moq_native::ClientCo
 	config
 }
 
+/// Permission for one session's task to report a terminal failure on the bus.
+///
+/// Held between creating the session and completing `READY -> PAUSED`. Marking it releases the task;
+/// dropping it unmarked leaves the task parked, which is what a rolled-back transition wants, since
+/// the session it belonged to is torn down with it.
+pub(crate) struct SessionRegistration {
+	gate: Arc<tokio::sync::Notify>,
+}
+
+impl SessionRegistration {
+	/// Release the task: the element installed this session, so its errors now have somewhere to land.
+	pub(crate) fn mark_registered(self) {
+		self.gate.notify_one();
+	}
+}
+
 /// A running session: the connect/lifecycle task plus the state the property getters read. Dropping the
 /// `Session` (or the producers held by the element) tears it down.
 pub(crate) struct Session {
@@ -152,7 +168,12 @@ impl Session {
 	pub fn start(
 		settings: ResolvedSettings,
 		element: glib::WeakRef<Element>,
-	) -> Result<(Self, moq_net::broadcast::Producer, moq_mux::catalog::Producer)> {
+	) -> Result<(
+		Self,
+		SessionRegistration,
+		moq_net::broadcast::Producer,
+		moq_mux::catalog::Producer,
+	)> {
 		// Producer setup may touch tokio time (group eviction), so run it inside the runtime context.
 		let _rt = RUNTIME.enter();
 
@@ -181,6 +202,9 @@ impl Session {
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
 
+		// The task is spawned parked. An immediate auth rejection would otherwise race the element
+		// installing this session, and its bus error would be discarded for belonging to no live one.
+		let gate = Arc::new(tokio::sync::Notify::new());
 		let join = RUNTIME.spawn(forward(
 			reconnect,
 			origin,
@@ -188,6 +212,7 @@ impl Session {
 			errored.clone(),
 			id.clone(),
 			element,
+			gate.clone(),
 		));
 
 		Ok((
@@ -199,6 +224,7 @@ impl Session {
 				recv_bandwidth,
 				errored,
 			},
+			SessionRegistration { gate },
 			broadcast,
 			catalog,
 		))
@@ -254,6 +280,25 @@ impl Drop for Session {
 /// [`Session`]'s `Drop` aborts this task, which drops the `Reconnect` handle and quietly tears the loop
 /// down.
 async fn forward(
+	reconnect: moq_native::Reconnect,
+	origin: moq_net::origin::Producer,
+	status: Arc<Status>,
+	errored: Arc<AtomicBool>,
+	id: SessionId,
+	element: glib::WeakRef<Element>,
+	registered: Arc<tokio::sync::Notify>,
+) {
+	wait_for_registration(registered).await;
+	forward_registered(reconnect, origin, status, errored, id, element).await;
+}
+
+async fn wait_for_registration(registered: Arc<tokio::sync::Notify>) {
+	// `Notify` keeps the permit, so marking before the task parks here is not a lost wakeup. A session
+	// rolled back instead of marked is aborted by `Session`'s `Drop`, which unparks nothing.
+	registered.notified().await;
+}
+
+async fn forward_registered(
 	mut reconnect: moq_native::Reconnect,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
@@ -326,5 +371,31 @@ fn notify(element: &glib::WeakRef<Element>, props: &[&str]) {
 		for prop in props {
 			obj.notify(prop);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn a_terminal_result_waits_until_the_session_is_registered() {
+		let gate = Arc::new(tokio::sync::Notify::new());
+		let registration = SessionRegistration { gate: gate.clone() };
+		let errored = Arc::new(AtomicBool::new(false));
+		let task_errored = errored.clone();
+		let (entered, reached) = tokio::sync::oneshot::channel();
+
+		let task = tokio::spawn(async move {
+			entered.send(()).unwrap();
+			wait_for_registration(gate).await;
+			task_errored.store(true, Ordering::Relaxed);
+		});
+		reached.await.unwrap();
+		assert!(!errored.load(Ordering::Relaxed), "the terminal result stayed parked");
+
+		registration.mark_registered();
+		task.await.unwrap();
+		assert!(errored.load(Ordering::Relaxed), "registration released it");
 	}
 }

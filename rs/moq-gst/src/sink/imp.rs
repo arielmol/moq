@@ -22,7 +22,7 @@ use hang::moq_net;
 
 use super::pad::{CapsOutcome, ProducerOptions, PushOutcome, caps_supported};
 use super::request_pad::{MoqSinkPad, Notifications};
-use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionId};
+use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionId, SessionRegistration};
 
 #[derive(Debug, Clone, Default)]
 struct Settings {
@@ -432,25 +432,46 @@ impl ElementImpl for MoqSink {
 
 	fn change_state(&self, transition: gst::StateChange) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
 		match transition {
-			gst::StateChange::ReadyToPaused => self.start_session()?,
-			gst::StateChange::PausedToReady => self.stop_session(),
-			_ => {}
+			gst::StateChange::ReadyToPaused => {
+				let registration = self.start_session()?;
+				// Rolled back on a failed parent transition: otherwise the session would keep publishing
+				// while the element sits in READY, with no later transition left to clean it up.
+				match self.parent_change_state(transition) {
+					Ok(success) => {
+						registration.mark_registered();
+						Ok(success)
+					}
+					Err(error) => {
+						self.stop_session();
+						Err(error)
+					}
+				}
+			}
+			// The parent goes first so it deactivates the pads and waits for the streaming functions to
+			// return before the session they write into is torn down. Cleanup is unconditional: a failed
+			// downward transition still leaves nothing that would ever release the publication.
+			gst::StateChange::PausedToReady => {
+				let result = self.parent_change_state(transition);
+				self.stop_session();
+				result
+			}
+			_ => self.parent_change_state(transition),
 		}
-		self.parent_change_state(transition)
 	}
 }
 
 impl MoqSink {
 	/// Create the session and producers before any buffer flows.
-	fn start_session(&self) -> Result<(), gst::StateChangeError> {
+	fn start_session(&self) -> Result<SessionRegistration, gst::StateChangeError> {
 		let settings = ResolvedSettings::try_from(self.settings.lock().unwrap().clone()).map_err(|err| {
 			gst::error!(CAT, obj = self.obj(), "invalid settings: {err:#}");
 			gst::StateChangeError
 		})?;
-		let (session, broadcast, catalog) = Session::start(settings, self.obj().downgrade()).map_err(|err| {
-			gst::error!(CAT, obj = self.obj(), "failed to start session: {err:?}");
-			gst::StateChangeError
-		})?;
+		let (session, registration, broadcast, catalog) =
+			Session::start(settings, self.obj().downgrade()).map_err(|err| {
+				gst::error!(CAT, obj = self.obj(), "failed to start session: {err:?}");
+				gst::StateChangeError
+			})?;
 		let error = session.error_flag();
 		let updates = {
 			let mut control = self.control.lock().unwrap();
@@ -476,7 +497,7 @@ impl MoqSink {
 				.collect::<Vec<_>>()
 		};
 		self.notify_updates(updates);
-		Ok(())
+		Ok(registration)
 	}
 
 	/// Finalize the producers (catalog last) and tear down the session. Finalize is best-effort: we are

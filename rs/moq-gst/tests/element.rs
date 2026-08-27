@@ -45,6 +45,31 @@ fn publisher() -> gst::Element {
 		.expect("create moqsink")
 }
 
+fn state_change_blocker(fail_when_active: bool) -> (gst::Pad, Arc<AtomicBool>) {
+	let enabled = Arc::new(AtomicBool::new(true));
+	let fail = enabled.clone();
+	let pad = gst::Pad::builder(gst::PadDirection::Sink)
+		.name("state-change-blocker")
+		.activatemode_function(move |_, _, _, active| {
+			if fail.load(Ordering::SeqCst) && active == fail_when_active {
+				return Err(gst::loggable_error!(gst::CAT_DEFAULT, "forced state-change failure"));
+			}
+			Ok(())
+		})
+		.build();
+	(pad, enabled)
+}
+
+fn assert_pad_has_no_live_publication(pad: &gst::Pad) {
+	pad.set_active(true).expect("activate the pad for the probe");
+	assert_eq!(
+		pad.chain(gst::Buffer::new()),
+		Err(gst::FlowError::Flushing),
+		"the failed transition left no publication attached to the pad"
+	);
+	pad.set_active(false).expect("deactivate the probe pad");
+}
+
 fn h264_caps() -> gst::Caps {
 	gst::Caps::builder("video/x-h264")
 		.field("stream-format", "byte-stream")
@@ -73,6 +98,58 @@ fn h264_keyframe() -> gst::Buffer {
 /// order, CAPS builds the producer.
 fn send_caps(pad: &gst::Pad) -> bool {
 	pad.send_event(gst::event::StreamStart::new("test")) && pad.send_event(gst::event::Caps::new(&h264_caps()))
+}
+
+// READY -> PAUSED is synchronous: the element creates its session without waiting for a buffer, which
+// is the preroll policy it inherits from deriving on GstElement rather than a sink base class.
+#[test]
+fn ready_to_paused_completes_without_a_buffer() {
+	init();
+	let sink = publisher();
+	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	assert_eq!(
+		sink.set_state(gst::State::Paused),
+		Ok(gst::StateChangeSuccess::Success),
+		"the transition completed rather than going async"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+#[test]
+fn a_failed_ready_to_paused_rolls_back_the_publication() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let (blocker, enabled) = state_change_blocker(true);
+	sink.add_pad(&blocker).expect("add activation blocker");
+
+	assert!(
+		sink.set_state(gst::State::Paused).is_err(),
+		"the parent transition reached the controlled activation failure"
+	);
+	assert_pad_has_no_live_publication(&pad);
+
+	enabled.store(false, Ordering::SeqCst);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+#[test]
+fn a_failed_paused_to_ready_still_releases_the_publication() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let (blocker, enabled) = state_change_blocker(false);
+	sink.add_pad(&blocker).expect("add deactivation blocker");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+
+	assert!(
+		sink.set_state(gst::State::Ready).is_err(),
+		"the parent transition reached the controlled deactivation failure"
+	);
+	assert_pad_has_no_live_publication(&pad);
+
+	enabled.store(false, Ordering::SeqCst);
+	let _ = sink.set_state(gst::State::Null);
 }
 
 // Request pads appear and disappear through the real GObject boundary, with no session attached.
