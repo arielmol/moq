@@ -77,6 +77,23 @@ fn h264_caps() -> gst::Caps {
 		.build()
 }
 
+fn unsupported_caps() -> gst::Caps {
+	gst::Caps::builder("video/x-raw").build()
+}
+
+fn request_unrestricted_sink_pad(sink: &gst::Element) -> gst::Pad {
+	let template = gst::PadTemplate::builder(
+		"sink_%u",
+		gst::PadDirection::Sink,
+		gst::PadPresence::Request,
+		&gst::Caps::new_any(),
+	)
+	.build()
+	.expect("build unrestricted request-pad template");
+	sink.request_pad(&template, Some("sink_0"), None)
+		.expect("request unrestricted sink_0")
+}
+
 fn h264_keyframe() -> gst::Buffer {
 	let sps: &[u8] = &[
 		0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
@@ -98,6 +115,27 @@ fn h264_keyframe() -> gst::Buffer {
 /// order, CAPS builds the producer.
 fn send_caps(pad: &gst::Pad) -> bool {
 	pad.send_event(gst::event::StreamStart::new("test")) && pad.send_event(gst::event::Caps::new(&h264_caps()))
+}
+
+/// Collect every message the element posts, so a test can assert what reached the bus and what did not.
+fn recording_bus(sink: &gst::Element) -> Arc<Mutex<Vec<gst::MessageType>>> {
+	let seen = Arc::new(Mutex::new(Vec::new()));
+	let recorder = seen.clone();
+	let bus = gst::Bus::new();
+	bus.set_sync_handler(move |_, message| {
+		recorder.lock().unwrap().push(message.type_());
+		gst::BusSyncReply::Drop
+	});
+	sink.set_bus(Some(&bus));
+	seen
+}
+
+fn posted_eos(seen: &Arc<Mutex<Vec<gst::MessageType>>>) -> usize {
+	seen.lock()
+		.unwrap()
+		.iter()
+		.filter(|kind| **kind == gst::MessageType::Eos)
+		.count()
 }
 
 // READY -> PAUSED is synchronous: the element creates its session without waiting for a buffer, which
@@ -149,6 +187,187 @@ fn a_failed_paused_to_ready_still_releases_the_publication() {
 	assert_pad_has_no_live_publication(&pad);
 
 	enabled.store(false, Ordering::SeqCst);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// A sink posts EOS only in PLAYING. Reaching it in PAUSED still finalizes the pad; the message waits.
+#[test]
+fn eos_in_paused_finalizes_but_holds_the_message() {
+	init();
+	let sink = publisher();
+	let seen = recording_bus(&sink);
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Paused).expect("start the session");
+	assert!(send_caps(&pad));
+
+	assert!(pad.send_event(gst::event::Eos::new()));
+	assert_eq!(status_of(&sink, "sink_0"), "ended", "the pad finalized in PAUSED");
+	assert_eq!(posted_eos(&seen), 0, "the message waits for PLAYING");
+
+	sink.set_state(gst::State::Playing).expect("Paused -> Playing");
+	assert_eq!(posted_eos(&seen), 1, "entering PLAYING released it");
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// One EOS per publication, not one per entry to PLAYING. Re-posting exists for a player that pauses at
+// the end of a file and resumes without seeking; here the publication is already consumed and the only
+// way back is a cycle through READY, so a second announcement would say nothing new.
+#[test]
+fn the_eos_is_posted_once_per_publication() {
+	init();
+	let sink = publisher();
+	let seen = recording_bus(&sink);
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	assert!(pad.send_event(gst::event::Eos::new()));
+	assert_eq!(posted_eos(&seen), 1);
+
+	sink.set_state(gst::State::Paused).expect("Playing -> Paused");
+	sink.set_state(gst::State::Playing).expect("Paused -> Playing");
+	assert_eq!(posted_eos(&seen), 1, "the second entry adds nothing");
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// After the publication ends, a buffer that got past the pad's own EOS flag (a flush clears it) must
+// report the end rather than be dropped as if it had been published.
+#[test]
+fn a_buffer_after_the_end_reports_eos_instead_of_ok() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+	segment.set_start(gst::ClockTime::ZERO);
+	assert!(pad.send_event(gst::event::Segment::new(&segment)));
+	assert!(pad.send_event(gst::event::Eos::new()));
+
+	// FLUSH_STOP clears the pad's EOS in the core, so the buffer reaches the chain function.
+	assert!(pad.send_event(gst::event::FlushStart::new()));
+	assert!(pad.send_event(gst::event::FlushStop::new(true)));
+	assert_eq!(
+		pad.chain(h264_keyframe()),
+		Err(gst::FlowError::Eos),
+		"the publication ended, so the buffer is refused rather than silently dropped"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// A SEGMENT after the end must not cost the pad its link. Losing it answered the next buffer with
+// Flushing, which reads as "this pad is going away" rather than "the publication is over".
+#[test]
+fn a_segment_after_the_end_keeps_the_terminal_result() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+	segment.set_start(gst::ClockTime::ZERO);
+	assert!(pad.send_event(gst::event::Segment::new(&segment)));
+	assert!(pad.send_event(gst::event::Eos::new()));
+
+	// The usual restart sequence: flush, then a fresh segment, then data.
+	assert!(pad.send_event(gst::event::FlushStart::new()));
+	assert!(pad.send_event(gst::event::FlushStop::new(true)));
+	assert!(pad.send_event(gst::event::Segment::new(&segment)));
+	assert_eq!(
+		pad.chain(h264_keyframe()),
+		Err(gst::FlowError::Eos),
+		"the publication ended, and a new segment does not change that"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// The authorization is the claim, taken while the element was playing. A handler that drops the
+// element to PAUSED between the notifications and the post does not revoke it: holding anything across
+// post_message() to make it revocable is the re-entrancy this element avoids by design.
+#[test]
+fn an_eos_claimed_while_playing_survives_a_handler_that_pauses() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+
+	let pause_succeeded = Arc::new(AtomicBool::new(false));
+	let eos_after_pause = Arc::new(AtomicBool::new(false));
+	let observed = eos_after_pause.clone();
+	let paused_before_eos = pause_succeeded.clone();
+	let bus = gst::Bus::new();
+	bus.set_sync_handler(move |_, message| {
+		if message.type_() == gst::MessageType::Eos {
+			observed.store(paused_before_eos.load(Ordering::SeqCst), Ordering::SeqCst);
+		}
+		gst::BusSyncReply::Drop
+	});
+	sink.set_bus(Some(&bus));
+
+	let paused = sink.clone();
+	let transition = pause_succeeded.clone();
+	child_of(&sink, "sink_0").connect_notify(Some("status"), move |_, _| {
+		if status_of(&paused, "sink_0") == "ended" {
+			transition.store(
+				paused.set_state(gst::State::Paused) == Ok(gst::StateChangeSuccess::Success),
+				Ordering::SeqCst,
+			);
+		}
+	});
+
+	assert!(pad.send_event(gst::event::Eos::new()));
+	assert_eq!(
+		sink.current_state(),
+		gst::State::Paused,
+		"the notify handler completed the downward transition"
+	);
+	assert!(
+		eos_after_pause.load(Ordering::SeqCst),
+		"the EOS was posted only after that transition completed"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// Leaving PLAYING closes the gate. Without that arm an EOS reached in PAUSED would go out immediately,
+// which is the rule the whole retention exists to keep.
+#[test]
+fn leaving_playing_holds_a_later_eos_until_the_next_entry() {
+	init();
+	let sink = publisher();
+	let seen = recording_bus(&sink);
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	sink.set_state(gst::State::Paused).expect("Playing -> Paused");
+
+	assert!(pad.send_event(gst::event::Eos::new()));
+	assert_eq!(posted_eos(&seen), 0, "the gate closed on the way down");
+
+	sink.set_state(gst::State::Playing).expect("Paused -> Playing");
+	assert_eq!(posted_eos(&seen), 1, "and the next entry delivers it once");
+	let _ = sink.set_state(gst::State::Null);
+}
+
+// The publication does not reopen: recovery is a cycle through READY, not a late pad.
+#[test]
+fn a_pad_requested_after_the_end_is_refused() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	assert!(pad.send_event(gst::event::Eos::new()));
+
+	assert!(
+		sink.request_pad_simple("sink_1").is_none(),
+		"a finished publication admits no new pad"
+	);
+	sink.set_state(gst::State::Ready).expect("Playing -> Ready");
+	sink.set_state(gst::State::Paused).expect("Ready -> Paused");
+	assert!(
+		sink.request_pad_simple("sink_1").is_some(),
+		"a new run admits pads again"
+	);
 	let _ = sink.set_state(gst::State::Null);
 }
 
@@ -449,9 +668,12 @@ fn invalid_caps_are_refused_at_the_caps_event() {
 #[test]
 fn unsupported_caps_are_refused_at_the_caps_event() {
 	init();
+	// Through an unrestricted pad, so the refusal comes from the element and not from the template
+	// filtering the caps out before the event function ever runs. Asserting the pad's status as well as
+	// the return value is what tells the two apart.
 	for refused in ["application/json", "video/x-raw"] {
 		let sink = publisher();
-		let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+		let pad = request_unrestricted_sink_pad(&sink);
 		sink.set_state(gst::State::Paused)
 			.expect("Ready -> Paused starts the session");
 		assert!(pad.send_event(gst::event::StreamStart::new("test")));
@@ -460,8 +682,61 @@ fn unsupported_caps_are_refused_at_the_caps_event() {
 			!pad.send_event(gst::event::Caps::new(&caps)),
 			"{refused} is refused at the CAPS event"
 		);
+		assert_eq!(
+			status_of(&sink, "sink_0"),
+			"error",
+			"{refused} reached the element and failed the pad"
+		);
 		let _ = sink.set_state(gst::State::Null);
 	}
+}
+
+#[test]
+fn unsupported_caps_mark_the_pad_unless_the_publication_is_terminal() {
+	init();
+
+	let sink = publisher();
+	let pad = request_unrestricted_sink_pad(&sink);
+	sink.set_state(gst::State::Ready)
+		.expect("enter READY without starting a session");
+	pad.set_active(true).expect("activate the pad without a session");
+	assert!(pad.send_event(gst::event::StreamStart::new("no-session")));
+	assert!(!pad.send_event(gst::event::Caps::new(&unsupported_caps())));
+	assert_eq!(
+		status_of(&sink, "sink_0"),
+		"error",
+		"no session still records the pad error"
+	);
+	pad.set_active(false).expect("deactivate the pad");
+	let _ = sink.set_state(gst::State::Null);
+
+	let sink = publisher();
+	let pad = request_unrestricted_sink_pad(&sink);
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	assert!(pad.send_event(gst::event::StreamStart::new("open")));
+	assert!(!pad.send_event(gst::event::Caps::new(&unsupported_caps())));
+	assert_eq!(
+		status_of(&sink, "sink_0"),
+		"error",
+		"an open publication records the pad error"
+	);
+	let _ = sink.set_state(gst::State::Null);
+
+	let sink = publisher();
+	let pad = request_unrestricted_sink_pad(&sink);
+	sink.set_state(gst::State::Playing).expect("start playing");
+	assert!(send_caps(&pad));
+	assert!(pad.send_event(gst::event::Eos::new()));
+	assert_eq!(status_of(&sink, "sink_0"), "ended");
+	assert!(pad.send_event(gst::event::StreamStart::new("terminal")));
+	assert!(!pad.send_event(gst::event::Caps::new(&unsupported_caps())));
+	assert_eq!(
+		status_of(&sink, "sink_0"),
+		"ended",
+		"late CAPS do not rewrite a terminal pad"
+	);
+	assert_eq!(track_error_of(&sink, "sink_0"), None);
+	let _ = sink.set_state(gst::State::Null);
 }
 
 // The acceptance criterion: a failed pad names its own reason, and the failure is isolated to it.
@@ -698,6 +973,8 @@ fn a_sync_bus_handler_can_read_the_status_on_eos() {
 	sink.set_state(gst::State::Paused)
 		.expect("Ready -> Paused starts the session");
 	assert!(send_caps(&pad));
+	// A sink posts EOS only in PLAYING, so the handler under test needs the element there to run at all.
+	sink.set_state(gst::State::Playing).expect("Paused -> Playing");
 
 	let seen = Arc::new(Mutex::new(None));
 	let recorder = seen.clone();

@@ -1,8 +1,7 @@
 //! The `sink_%u` request pad as its own GObject, so the track it publishes can be named from a
 //! pipeline description through `GstChildProxy` (`moqsink sink_0::track=camera`).
 
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use gst::glib;
 use gst::prelude::*;
@@ -10,7 +9,7 @@ use gst::subclass::prelude::*;
 
 use super::MediaContainer;
 use super::pad::Pad;
-use super::session::CAT;
+use super::session::{CAT, CompletionHandle};
 
 /// What the pad's track is doing, as reported by the `status` property.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
@@ -54,7 +53,9 @@ pub(super) struct PadLifecycle {
 	pub(super) media: Pad,
 	pub(super) ended: bool,
 	pub(super) releasing: bool,
-	pub(super) session_error: Option<Arc<AtomicBool>>,
+	/// This pad's link to its publication. `None` is no live session for the pad, which is why a buffer
+	/// arriving before one exists is refused rather than dropped.
+	pub(super) completion: Option<CompletionHandle>,
 }
 
 impl Default for PadLifecycle {
@@ -64,7 +65,7 @@ impl Default for PadLifecycle {
 			media: Pad::new(),
 			ended: false,
 			releasing: false,
-			session_error: None,
+			completion: None,
 		}
 	}
 }
@@ -146,7 +147,7 @@ impl PadLifecycle {
 		let status = self.settings.set_status(Status::Pending);
 		self.media = Pad::new();
 		self.ended = false;
-		self.session_error = None;
+		self.completion = None;
 		Notifications { track, status, error }
 	}
 }

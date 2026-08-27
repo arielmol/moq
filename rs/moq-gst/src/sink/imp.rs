@@ -9,7 +9,6 @@
 //! Locks are nested in one direction only: GStreamer's stream lock, then the element control, then a
 //! pad lifecycle, then an object lock. No path takes the element control while holding a pad lifecycle.
 
-use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -22,7 +21,9 @@ use hang::moq_net;
 
 use super::pad::{CapsOutcome, ProducerOptions, PushOutcome, caps_supported};
 use super::request_pad::{MoqSinkPad, Notifications};
-use super::session::{CAT, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionId, SessionRegistration};
+use super::session::{
+	CAT, Completion, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionId, SessionRegistration,
+};
 
 #[derive(Debug, Clone, Default)]
 struct Settings {
@@ -60,7 +61,16 @@ struct State {
 	session: Session,
 	broadcast: moq_net::broadcast::Producer,
 	catalog: Option<moq_mux::catalog::Producer>,
-	eos_posted: bool,
+	/// Whether this publication's single EOS message already went out. One per publication, not per
+	/// entry to PLAYING: a finished publication is terminal here, so there is nothing to announce twice.
+	eos_delivered: bool,
+}
+
+impl State {
+	/// Whether this publication still accepts pads, negotiation and buffers.
+	fn is_open(&self) -> bool {
+		self.session.completion().is_open()
+	}
 }
 
 /// Element state that survives session replacement.
@@ -68,6 +78,31 @@ struct State {
 struct Control {
 	live: Option<State>,
 	admissions: usize,
+	/// Whether the element completed its transition into PLAYING. Tracked here rather than read from
+	/// GStreamer: the current state is not committed until `change_state` returns, so a message earned
+	/// inside that window would read PAUSED and be held with nobody left to release it.
+	playing: bool,
+}
+
+/// Claim this publication's EOS, if it is owed and may go out now.
+///
+/// One claim per publication, so whichever arrives first (the transition into PLAYING, or the pad that
+/// ended it) is the only one that posts. Called under `control`, which is what serializes the two.
+fn claim_eos(control: &mut Control) -> Posted {
+	if !control.playing {
+		return Posted::Nothing;
+	}
+	let Some(state) = control.live.as_mut() else {
+		return Posted::Nothing;
+	};
+	if state.eos_delivered || state.session.completion().get() != Completion::Eos {
+		return Posted::Nothing;
+	}
+	state.eos_delivered = true;
+	Posted::Message {
+		session: state.session.id().clone(),
+		kind: MessageKind::Eos,
+	}
 }
 
 /// A pad whose already-applied state change still needs GObject notification.
@@ -94,6 +129,12 @@ enum MessageKind {
 	FinalizeError(String),
 	/// The reconnect task stopped on a terminal error.
 	SessionError(String),
+}
+
+/// Whether confirming an admission left a usable pad.
+enum Admission {
+	Accepted,
+	Rejected,
 }
 
 /// The result of a finalize pass: which pads to report, and what the element owes the bus.
@@ -371,8 +412,8 @@ impl ElementImpl for MoqSink {
 		};
 		{
 			let mut control = self.control.lock().unwrap();
-			if control.live.as_ref().is_some_and(|state| state.eos_posted) {
-				gst::warning!(CAT, "refusing a pad after EOS: the session is finalized");
+			if control.live.as_ref().is_some_and(|state| !state.is_open()) {
+				gst::warning!(CAT, "refusing a pad: the publication has ended");
 				return None;
 			}
 			control.admissions += 1;
@@ -387,13 +428,19 @@ impl ElementImpl for MoqSink {
 			return None;
 		}
 		self.obj().child_added(&pad, pad.name().as_str());
-		let finished = self.confirm_admission(&pad);
+		let (admission, finished) = self.confirm_admission(&pad);
 		self.publish_finished(finished);
-		if !self.owns_pad(&pad) {
-			pad.reset_detached();
-			return None;
+		// The ownership check is a second question, about what the notifications above may have done.
+		match admission {
+			Admission::Accepted if self.owns_pad(&pad) => Some(pad.upcast()),
+			_ => {
+				match self.owns_pad(&pad) {
+					true => self.release_pad(pad.upcast_ref()),
+					false => pad.reset_detached(),
+				}
+				None
+			}
 		}
-		Some(pad.upcast())
 	}
 
 	fn release_pad(&self, pad: &gst::Pad) {
@@ -447,11 +494,25 @@ impl ElementImpl for MoqSink {
 					}
 				}
 			}
+			// The parent finishes the transition before the element is allowed to speak for PLAYING.
+			gst::StateChange::PausedToPlaying => {
+				let success = self.parent_change_state(transition)?;
+				self.enter_playing();
+				Ok(success)
+			}
+			// Fail-closed like the transition below it: a failed parent still left PLAYING, and a gate
+			// held open would let the next EOS out as if the element were still playing.
+			gst::StateChange::PlayingToPaused => {
+				let result = self.parent_change_state(transition);
+				self.leave_playing();
+				result
+			}
 			// The parent goes first so it deactivates the pads and waits for the streaming functions to
 			// return before the session they write into is torn down. Cleanup is unconditional: a failed
 			// downward transition still leaves nothing that would ever release the publication.
 			gst::StateChange::PausedToReady => {
 				let result = self.parent_change_state(transition);
+				self.leave_playing();
 				self.stop_session();
 				result
 			}
@@ -472,14 +533,14 @@ impl MoqSink {
 				gst::error!(CAT, obj = self.obj(), "failed to start session: {err:?}");
 				gst::StateChangeError
 			})?;
-		let error = session.error_flag();
+		let completion = session.completion();
 		let updates = {
 			let mut control = self.control.lock().unwrap();
 			control.live = Some(State {
 				session,
 				broadcast,
 				catalog: Some(catalog),
-				eos_posted: false,
+				eos_delivered: false,
 			});
 			self.obj()
 				.sink_pads()
@@ -489,7 +550,7 @@ impl MoqSink {
 					let changes = {
 						let mut lifecycle = pad.lifecycle();
 						let changes = lifecycle.reset();
-						lifecycle.session_error = Some(error.clone());
+						lifecycle.completion = Some(completion.clone());
 						changes
 					};
 					PadUpdate { pad, changes }
@@ -570,15 +631,15 @@ impl MoqSink {
 		let _rt = RUNTIME.enter();
 		let (outcome, changes) = {
 			let mut lifecycle = pad.lifecycle();
-			if lifecycle.releasing || lifecycle.session_error.is_none() {
+			let Some(completion) = lifecycle.completion.as_ref().filter(|_| !lifecycle.releasing) else {
 				return Err(gst::FlowError::Flushing);
-			}
-			if lifecycle
-				.session_error
-				.as_ref()
-				.is_some_and(|error| error.load(Ordering::Relaxed))
-			{
-				return Err(gst::FlowError::Error);
+			};
+			// The element's own end comes before the pad's: a broken rendition is isolated so the others
+			// keep publishing, but a finished publication is not something one pad may report as OK.
+			match completion.get() {
+				Completion::Failed => return Err(gst::FlowError::Error),
+				Completion::Eos => return Err(gst::FlowError::Eos),
+				Completion::Open => {}
 			}
 			if lifecycle.media.is_failed() {
 				return Ok(gst::FlowSuccess::Ok);
@@ -626,27 +687,46 @@ impl MoqSink {
 		match event.view() {
 			gst::EventView::Caps(caps) => {
 				let caps = caps.caps().to_owned();
+				// A pure check, so it runs before any lock is taken.
 				if !caps_supported(&caps) {
 					gst::warning!(CAT, "rejecting unsupported caps on pad {}", pad.name());
+					// The negotiation is refused either way, but recording it on the pad is not always
+					// allowed. No publication yet is not the same as one that ended: with no session, or
+					// with an open one, the pad takes the error; after a terminal state `ended` and
+					// `error` are settled and a late caps event must not rewrite one as the other.
 					let changes = {
 						let _rt = RUNTIME.enter();
-						let mut lifecycle = sink_pad.lifecycle();
-						lifecycle.media.invalidate();
-						lifecycle.fail(format!("unsupported caps: {caps}"))
+						let control = self.control.lock().unwrap();
+						let terminal = control.live.as_ref().is_some_and(|state| !state.is_open());
+						match terminal {
+							true => None,
+							false => {
+								let mut lifecycle = sink_pad.lifecycle();
+								match lifecycle.releasing {
+									true => None,
+									false => {
+										lifecycle.media.invalidate();
+										Some(lifecycle.fail(format!("unsupported caps: {caps}")))
+									}
+								}
+							}
+						}
 					};
-					sink_pad.notify_changes(changes);
+					if let Some(changes) = changes {
+						sink_pad.notify_changes(changes);
+					}
 					return false;
 				}
 				let (changes, accepted) = {
 					let _rt = RUNTIME.enter();
 					let control = self.control.lock().unwrap();
-					let Some(state) = control.live.as_ref().filter(|state| !state.eos_posted) else {
+					let Some(state) = control.live.as_ref().filter(|state| state.is_open()) else {
 						return gst::Pad::event_default(pad, Some(&*self.obj()), event);
 					};
 					let Some(catalog) = state.catalog.as_ref() else {
 						return gst::Pad::event_default(pad, Some(&*self.obj()), event);
 					};
-					let error = state.session.error_flag();
+					let completion = state.session.completion();
 					let mut lifecycle = sink_pad.lifecycle();
 					if lifecycle.releasing {
 						return false;
@@ -657,7 +737,7 @@ impl MoqSink {
 						options = options.with_track(track);
 					}
 					let outcome = lifecycle.media.observe_caps(&state.broadcast, catalog, options);
-					lifecycle.session_error = Some(error);
+					lifecycle.completion = Some(completion);
 					match outcome {
 						CapsOutcome::Active(track) => (Some(lifecycle.commit(track)), true),
 						CapsOutcome::Failed(reason) => (Some(lifecycle.fail(reason)), false),
@@ -671,15 +751,18 @@ impl MoqSink {
 			}
 			gst::EventView::Segment(segment) => {
 				let control = self.control.lock().unwrap();
-				let error = control
-					.live
-					.as_ref()
-					.filter(|state| !state.eos_posted)
-					.map(|state| state.session.error_flag());
+				let completion = control.live.as_ref().map(|state| state.session.completion());
 				let mut lifecycle = sink_pad.lifecycle();
 				if !lifecycle.releasing {
-					lifecycle.session_error = error;
-					if lifecycle.session_error.is_some() {
+					// The link is which publication the pad belongs to, not whether that publication is
+					// still open. Dropping it after the end would answer the next buffer with Flushing
+					// instead of the terminal result it earned.
+					lifecycle.completion = completion;
+					if lifecycle
+						.completion
+						.as_ref()
+						.is_some_and(|completion| completion.is_open())
+					{
 						lifecycle.media.observe_segment(segment.segment().to_owned());
 					}
 				}
@@ -690,7 +773,7 @@ impl MoqSink {
 			gst::EventView::Eos(_) => {
 				let finished = {
 					let mut control = self.control.lock().unwrap();
-					if control.live.as_ref().is_some_and(|state| !state.eos_posted) {
+					if control.live.as_ref().is_some_and(|state| state.is_open()) {
 						let mut lifecycle = sink_pad.lifecycle();
 						if !lifecycle.releasing {
 							lifecycle.ended = true;
@@ -703,7 +786,7 @@ impl MoqSink {
 			}
 			gst::EventView::FlushStop(_) => {
 				let control = self.control.lock().unwrap();
-				if control.live.as_ref().is_some_and(|state| !state.eos_posted) {
+				if control.live.as_ref().is_some_and(|state| state.is_open()) {
 					let mut lifecycle = sink_pad.lifecycle();
 					if !lifecycle.releasing {
 						lifecycle.ended = false;
@@ -715,7 +798,7 @@ impl MoqSink {
 			}
 			gst::EventView::StreamStart(_) => {
 				let control = self.control.lock().unwrap();
-				if control.live.as_ref().is_some_and(|state| !state.eos_posted) {
+				if control.live.as_ref().is_some_and(|state| state.is_open()) {
 					let mut lifecycle = sink_pad.lifecycle();
 					if !lifecycle.releasing {
 						lifecycle.ended = false;
@@ -753,19 +836,29 @@ impl MoqSink {
 		self.maybe_finish_locked(control)
 	}
 
-	fn confirm_admission(&self, pad: &MoqSinkPad) -> Finished {
+	fn confirm_admission(&self, pad: &MoqSinkPad) -> (Admission, Finished) {
 		let mut control = self.control.lock().unwrap();
-		let error = control
-			.live
-			.as_ref()
-			.filter(|state| !state.eos_posted)
-			.map(|state| state.session.error_flag());
+		let completion = control.live.as_ref().map(|state| state.session.completion());
 		let mut lifecycle = pad.lifecycle();
-		if !lifecycle.releasing {
-			lifecycle.session_error = error;
-		}
+		// Decided here, holding both locks. `owns_pad` cannot answer it: a pad stays the element's
+		// between being marked `releasing` and being removed, and a second look at the publication
+		// would read a different instant than the one this confirmation ran in.
+		let admission = match lifecycle.releasing {
+			true => Admission::Rejected,
+			false => {
+				let failed = completion
+					.as_ref()
+					.is_some_and(|completion| completion.get() == Completion::Failed);
+				lifecycle.completion = completion;
+				match failed {
+					true => Admission::Rejected,
+					false => Admission::Accepted,
+				}
+			}
+		};
 		drop(lifecycle);
-		self.finish_admission_locked(&mut control)
+		let finished = self.finish_admission_locked(&mut control);
+		(admission, finished)
 	}
 
 	fn maybe_finish_locked(&self, control: &mut Control) -> Finished {
@@ -782,11 +875,10 @@ impl MoqSink {
 			.filter_map(|pad| pad.downcast::<MoqSinkPad>().ok())
 			.collect::<Vec<_>>();
 		let all_ended = !pads.is_empty() && pads.iter().all(|pad| pad.lifecycle().ended);
-		if !all_ended || state.eos_posted {
+		if !all_ended || !state.is_open() {
 			return Finished::default();
 		}
 
-		state.eos_posted = true;
 		let _rt = RUNTIME.enter();
 		let mut updates = Vec::new();
 		let mut failure = None;
@@ -819,13 +911,22 @@ impl MoqSink {
 		{
 			failure = Some(err);
 		}
-		let kind = match failure {
-			Some(err) => MessageKind::FinalizeError(format!("{err:?}")),
-			None => MessageKind::Eos,
-		};
-		let message = Posted::Message {
-			session: state.session.id().clone(),
-			kind,
+		// Claimed after the work, not before: the outcome decides which terminal state this pass takes.
+		// Losing the claim means the session task already ended the publication and posted its own
+		// error, so this pass owes the bus nothing.
+		let completion = state.session.completion();
+		let message = match failure {
+			Some(err) => match completion.fail() {
+				true => Posted::Message {
+					session: state.session.id().clone(),
+					kind: MessageKind::FinalizeError(format!("{err:?}")),
+				},
+				false => Posted::Nothing,
+			},
+			None => {
+				completion.finish();
+				claim_eos(control)
+			}
 		};
 		Finished { updates, message }
 	}
@@ -836,6 +937,24 @@ impl MoqSink {
 		}
 	}
 
+	/// Open the EOS gate for this run and post the message if the publication already ended.
+	fn enter_playing(&self) {
+		let message = {
+			let mut control = self.control.lock().unwrap();
+			control.playing = true;
+			claim_eos(&mut control)
+		};
+		self.publish_finished(Finished {
+			updates: Vec::new(),
+			message,
+		});
+	}
+
+	/// Close the gate: an EOS earned from here on waits for the next entry to PLAYING.
+	fn leave_playing(&self) {
+		self.control.lock().unwrap().playing = false;
+	}
+
 	fn publish_finished(&self, finished: Finished) {
 		self.notify_updates(finished.updates);
 		self.post_current(finished.message);
@@ -843,9 +962,12 @@ impl MoqSink {
 
 	/// Route a terminal reconnect error through the same session gate as finalization messages.
 	pub(super) fn post_session_error(&self, session: &SessionId, error: String) {
-		self.post_current(Posted::Message {
-			session: session.clone(),
-			kind: MessageKind::SessionError(error),
+		self.publish_finished(Finished {
+			updates: Vec::new(),
+			message: Posted::Message {
+				session: session.clone(),
+				kind: MessageKind::SessionError(error),
+			},
 		});
 	}
 
@@ -890,10 +1012,10 @@ impl MoqSink {
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
-	use std::sync::atomic::AtomicBool;
 
 	use super::super::MediaContainer;
 	use super::super::request_pad::Status;
+	use super::super::session::CompletionState;
 	use super::*;
 
 	fn sink() -> super::super::MoqSink {
@@ -902,6 +1024,116 @@ mod tests {
 
 	fn spec(element: &super::super::MoqSink, name: &str) -> glib::ParamSpec {
 		element.find_property(name).unwrap()
+	}
+
+	/// The live publication's completion, for a test that needs to race it.
+	fn completion_of(sink: &super::super::MoqSink) -> super::super::session::CompletionHandle {
+		sink.imp()
+			.control
+			.lock()
+			.unwrap()
+			.live
+			.as_ref()
+			.expect("live session")
+			.session
+			.completion()
+	}
+
+	// A pad marked for release is still the element's until it is removed, so the confirmation has to
+	// say it refused. Inferring it from `owns_pad` would hand the caller a pad already on its way out.
+	#[test]
+	fn confirming_an_admission_refuses_a_pad_already_releasing() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "test");
+		let element = sink.clone().upcast::<gst::Element>();
+		let pad = element.request_pad_simple("sink_0").expect("request sink_0");
+		element.set_state(gst::State::Paused).expect("start session");
+		let pad = pad.downcast::<MoqSinkPad>().expect("MoqSinkPad");
+
+		pad.lifecycle().releasing = true;
+		sink.imp().control.lock().unwrap().admissions += 1;
+		let (admission, finished) = sink.imp().confirm_admission(&pad);
+		sink.imp().publish_finished(finished);
+
+		assert!(matches!(admission, Admission::Rejected), "the confirmation refused it");
+		assert!(
+			sink.imp().owns_pad(&pad),
+			"and it did so while the pad still belonged to the element, which is the window \
+			 `owns_pad` cannot see"
+		);
+		pad.lifecycle().releasing = false;
+		let _ = element.set_state(gst::State::Null);
+	}
+
+	// The transition is a compare-exchange, not a store: whoever arrives second changes nothing and is
+	// told so. A store would let a late session error rewrite an EOS the element already earned.
+	#[test]
+	fn only_the_first_terminal_transition_wins() {
+		let completion = CompletionState::new();
+		assert!(completion.finish(), "the first transition wins");
+		assert!(!completion.fail(), "the second is refused");
+		assert_eq!(completion.get(), Completion::Eos);
+		assert!(!completion.is_open());
+
+		let completion = CompletionState::new();
+		assert!(completion.fail());
+		assert!(!completion.finish(), "a clean end cannot follow a failure");
+		assert_eq!(completion.get(), Completion::Failed);
+	}
+
+	// A pad admitted while the publication was open must not be handed back once it failed underneath:
+	// it would only refuse every buffer. A clean EOS is the opposite case, covered by the pad-added
+	// tests that let a pad end the publication and still read its own status.
+	#[test]
+	fn a_pad_is_withdrawn_when_the_publication_fails_while_it_is_admitted() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "test");
+		let element = sink.clone().upcast::<gst::Element>();
+		element.set_state(gst::State::Paused).expect("start session");
+
+		let failing = sink.clone();
+		element.connect_pad_added(move |_, _| {
+			completion_of(&failing).fail();
+		});
+
+		assert!(
+			element.request_pad_simple("sink_0").is_none(),
+			"the pad is withdrawn instead of returned unusable"
+		);
+		assert_eq!(element.num_sink_pads(), 0, "and it is not left on the element");
+		let _ = element.set_state(gst::State::Null);
+	}
+
+	// A task outliving its session writes into the handle nobody reads any more. Scoping falls out of
+	// the topology: no id comparison guards the state the pads see.
+	#[test]
+	fn a_stale_completion_cannot_end_the_next_publication() {
+		gst::init().unwrap();
+		let sink = sink();
+		sink.set_property("url", "https://127.0.0.1:1");
+		sink.set_property("broadcast", "test");
+		let element = sink.clone().upcast::<gst::Element>();
+		let pad = element.request_pad_simple("sink_0").expect("request sink_0");
+
+		element.set_state(gst::State::Paused).expect("first session");
+		let stale = completion_of(&sink);
+		element.set_state(gst::State::Ready).expect("stop the first session");
+		element.set_state(gst::State::Paused).expect("second session");
+
+		assert!(stale.fail(), "the old task still owns its own handle");
+		assert!(
+			completion_of(&sink).is_open(),
+			"the publication the pads read is untouched"
+		);
+		let pad = pad.downcast::<MoqSinkPad>().expect("MoqSinkPad");
+		let linked = pad.lifecycle().completion.clone().expect("session link");
+		assert!(!Arc::ptr_eq(&linked, &stale), "the pad was relinked to the new session");
+		assert!(linked.is_open());
+		let _ = element.set_state(gst::State::Null);
 	}
 
 	#[test]
@@ -954,23 +1186,24 @@ mod tests {
 			.as_ref()
 			.expect("live session")
 			.session
-			.error_flag();
-		let stale = Arc::new(AtomicBool::new(true));
-		pad.lifecycle().session_error = Some(stale.clone());
+			.completion();
+		let stale = CompletionState::new();
+		stale.fail();
+		pad.lifecycle().completion = Some(stale.clone());
 		sink.imp().control.lock().unwrap().admissions += 1;
-		let finished = sink.imp().confirm_admission(&pad);
+		let (_, finished) = sink.imp().confirm_admission(&pad);
 		sink.imp().publish_finished(finished);
 
-		let actual = pad.lifecycle().session_error.clone().expect("session link");
+		let actual = pad.lifecycle().completion.clone().expect("session link");
 		assert!(Arc::ptr_eq(&actual, &expected));
 		assert!(!Arc::ptr_eq(&actual, &stale));
 
 		element.set_state(gst::State::Ready).expect("stop session");
-		pad.lifecycle().session_error = Some(stale);
+		pad.lifecycle().completion = Some(stale);
 		sink.imp().control.lock().unwrap().admissions += 1;
-		let finished = sink.imp().confirm_admission(&pad);
+		let (_, finished) = sink.imp().confirm_admission(&pad);
 		sink.imp().publish_finished(finished);
-		assert!(pad.lifecycle().session_error.is_none());
+		assert!(pad.lifecycle().completion.is_none());
 		let _ = element.set_state(gst::State::Null);
 	}
 
