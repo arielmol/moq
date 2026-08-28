@@ -22,7 +22,7 @@ use hang::moq_net;
 use super::pad::{CapsOutcome, ProducerOptions, PushOutcome, caps_supported};
 use super::request_pad::{MoqSinkPad, Notifications};
 use super::session::{
-	CAT, Completion, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionId, SessionRegistration,
+	CAT, Completion, CompletionHandle, ConnectionStatus, RUNTIME, ResolvedSettings, Session, SessionRegistration,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -100,7 +100,7 @@ fn claim_eos(control: &mut Control) -> Posted {
 	}
 	state.eos_delivered = true;
 	Posted::Message {
-		session: state.session.id().clone(),
+		session: state.session.completion(),
 		kind: MessageKind::Eos,
 	}
 }
@@ -117,8 +117,11 @@ enum Posted {
 	/// Nothing to post: the pass did not run.
 	#[default]
 	Nothing,
-	/// A message earned by one publishing session.
-	Message { session: SessionId, kind: MessageKind },
+	/// A message earned by one publishing session, identified by that session's completion handle.
+	Message {
+		session: CompletionHandle,
+		kind: MessageKind,
+	},
 }
 
 /// The element-wide outcome a publishing session earned.
@@ -939,7 +942,7 @@ impl MoqSink {
 		let message = match failure {
 			Some(err) => match completion.fail() {
 				true => Posted::Message {
-					session: state.session.id().clone(),
+					session: state.session.completion(),
 					kind: MessageKind::FinalizeError(format!("{err:?}")),
 				},
 				false => Posted::Nothing,
@@ -982,7 +985,7 @@ impl MoqSink {
 	}
 
 	/// Route a terminal reconnect error through the same session gate as finalization messages.
-	pub(super) fn post_session_error(&self, session: &SessionId, error: String) {
+	pub(super) fn post_session_error(&self, session: &CompletionHandle, error: String) {
 		self.publish_finished(Finished {
 			updates: Vec::new(),
 			message: Posted::Message {
@@ -1004,7 +1007,7 @@ impl MoqSink {
 			.unwrap()
 			.live
 			.as_ref()
-			.is_some_and(|state| state.session.id().matches(&session));
+			.is_some_and(|state| std::sync::Arc::ptr_eq(&state.session.completion(), &session));
 		if !current {
 			gst::debug!(
 				CAT,
@@ -1301,8 +1304,7 @@ mod tests {
 			.as_ref()
 			.expect("live session")
 			.session
-			.id()
-			.clone();
+			.completion();
 		while bus.pop().is_some() {}
 
 		sink.imp().post_current(Posted::Message {
@@ -1340,8 +1342,7 @@ mod tests {
 			.as_ref()
 			.expect("first session")
 			.session
-			.id()
-			.clone();
+			.completion();
 
 		element.set_state(gst::State::Ready).expect("stop first session");
 		element
@@ -1356,8 +1357,7 @@ mod tests {
 			.as_ref()
 			.expect("replacement session")
 			.session
-			.id()
-			.clone();
+			.completion();
 		while bus.pop().is_some() {}
 		sink.imp().post_current(Posted::Message {
 			session: first.clone(),

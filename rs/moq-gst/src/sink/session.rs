@@ -65,21 +65,6 @@ pub struct Status {
 	inner: Mutex<StatusInner>,
 }
 
-/// Opaque identity retained by one publishing session and all of its pending messages.
-#[derive(Clone)]
-pub(super) struct SessionId(Arc<()>);
-
-impl SessionId {
-	fn new() -> Self {
-		Self(Arc::new(()))
-	}
-
-	/// Whether both tokens identify the same publishing session.
-	pub(super) fn matches(&self, other: &Self) -> bool {
-		Arc::ptr_eq(&self.0, &other.0)
-	}
-}
-
 impl Status {
 	/// Set the connection status and negotiated version together, so a `notify::status` handler that
 	/// re-reads `moq-version` sees the two consistent.
@@ -151,9 +136,10 @@ pub(crate) struct CompletionState(AtomicU8);
 
 /// One publication's completion, shared by its session task and by its pads.
 ///
-/// Every clone belongs to one exact session. A task that outlived its session still holds only that
-/// session's handle, so it cannot reach the state a newer session's pads read: a terminal error
-/// staying inside its own session falls out of the topology instead of being checked against an id.
+/// Every clone belongs to one exact session, so this doubles as the session's identity: a task that
+/// outlived its session still holds only that session's handle, and `Arc::ptr_eq` answers whether a
+/// deferred message still belongs to the live publication. A terminal error staying inside its own
+/// session falls out of the topology rather than being checked against a separate id.
 pub(crate) type CompletionHandle = Arc<CompletionState>;
 
 impl CompletionState {
@@ -215,7 +201,6 @@ impl SessionRegistration {
 /// A running session: the connect/lifecycle task plus the state the property getters read. Dropping the
 /// `Session` (or the producers held by the element) tears it down.
 pub(crate) struct Session {
-	id: SessionId,
 	join: tokio::task::JoinHandle<()>,
 	status: Arc<Status>,
 	/// The live send-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
@@ -253,7 +238,6 @@ impl Session {
 
 		let status = Arc::new(Status::default());
 		let completion = CompletionState::new();
-		let id = SessionId::new();
 
 		// Publish through a background reconnect loop: connect, wait for close, reconnect with backoff.
 		// `timeout = 0` drops the give-up deadline so an unattended publisher outlives relay/QUIC
@@ -277,14 +261,12 @@ impl Session {
 			origin,
 			status.clone(),
 			completion.clone(),
-			id.clone(),
 			element,
 			gate.clone(),
 		));
 
 		Ok((
 			Self {
-				id,
 				join,
 				status,
 				send_bandwidth,
@@ -295,11 +277,6 @@ impl Session {
 			broadcast,
 			catalog,
 		))
-	}
-
-	/// The identity that scopes element-wide messages to this session.
-	pub(super) fn id(&self) -> &SessionId {
-		&self.id
 	}
 
 	/// The live status, read by the element's property getters.
@@ -351,12 +328,11 @@ async fn forward(
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
 	completion: CompletionHandle,
-	id: SessionId,
 	element: glib::WeakRef<Element>,
 	registered: Arc<tokio::sync::Notify>,
 ) {
 	wait_for_registration(registered).await;
-	forward_registered(reconnect, origin, status, completion, id, element).await;
+	forward_registered(reconnect, origin, status, completion, element).await;
 }
 
 async fn wait_for_registration(registered: Arc<tokio::sync::Notify>) {
@@ -370,7 +346,6 @@ async fn forward_registered(
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
 	completion: CompletionHandle,
-	id: SessionId,
 	element: glib::WeakRef<Element>,
 ) {
 	// Hold the origin producer for the task's lifetime so the broadcast created on it stays routable:
@@ -410,7 +385,7 @@ async fn forward_registered(
 					status.set(ConnectionStatus::Failed, None);
 					notify(&element, &["status", "connected", "moq-version"]);
 					if won && let Some(obj) = element.upgrade() {
-						obj.imp().post_session_error(&id, format!("{err:?}"));
+						obj.imp().post_session_error(&completion, format!("{err:?}"));
 					}
 					return;
 				}
