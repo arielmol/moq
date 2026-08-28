@@ -722,32 +722,38 @@ impl MoqSink {
 					}
 					return false;
 				}
-				let (changes, accepted) = {
+				// Negotiated under the control lock, but `event_default` runs after it drops: a sync
+				// handler reached from there can re-enter the element and take the same lock.
+				let negotiated = {
 					let _rt = RUNTIME.enter();
 					let control = self.control.lock().unwrap();
-					let Some(state) = control.live.as_ref().filter(|state| state.is_open()) else {
-						return gst::Pad::event_default(pad, Some(&*self.obj()), event);
-					};
-					let Some(catalog) = state.catalog.as_ref() else {
-						return gst::Pad::event_default(pad, Some(&*self.obj()), event);
-					};
-					let completion = state.session.completion();
-					let mut lifecycle = sink_pad.lifecycle();
-					if lifecycle.releasing {
-						return false;
+					if let Some(state) = control.live.as_ref().filter(|state| state.is_open())
+						&& let Some(catalog) = state.catalog.as_ref()
+					{
+						let completion = state.session.completion();
+						let mut lifecycle = sink_pad.lifecycle();
+						if lifecycle.releasing {
+							return false;
+						}
+						let requested = lifecycle.requested().map(str::to_owned);
+						let mut options = ProducerOptions::new(&caps).with_container(lifecycle.container().into());
+						if let Some(track) = requested.as_deref() {
+							options = options.with_track(track);
+						}
+						let outcome = lifecycle.media.observe_caps(&state.broadcast, catalog, options);
+						lifecycle.completion = Some(completion);
+						Some(match outcome {
+							CapsOutcome::Active(track) => (Some(lifecycle.commit(track)), true),
+							CapsOutcome::Failed(reason) => (Some(lifecycle.fail(reason)), false),
+							CapsOutcome::Unchanged => (None, true),
+						})
+					} else {
+						None
 					}
-					let requested = lifecycle.requested().map(str::to_owned);
-					let mut options = ProducerOptions::new(&caps).with_container(lifecycle.container().into());
-					if let Some(track) = requested.as_deref() {
-						options = options.with_track(track);
-					}
-					let outcome = lifecycle.media.observe_caps(&state.broadcast, catalog, options);
-					lifecycle.completion = Some(completion);
-					match outcome {
-						CapsOutcome::Active(track) => (Some(lifecycle.commit(track)), true),
-						CapsOutcome::Failed(reason) => (Some(lifecycle.fail(reason)), false),
-						CapsOutcome::Unchanged => (None, true),
-					}
+				};
+				// No live publication to negotiate against, so forward without touching the pad.
+				let Some((changes, accepted)) = negotiated else {
+					return gst::Pad::event_default(pad, Some(&*self.obj()), event);
 				};
 				if let Some(changes) = changes {
 					sink_pad.notify_changes(changes);
