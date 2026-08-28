@@ -1179,11 +1179,11 @@ mod tests {
 		sink.imp().control.lock().unwrap().admissions += 1;
 		assert!(pad.send_event(gst::event::Eos::new()));
 		let pad = pad.downcast::<MoqSinkPad>().expect("MoqSinkPad");
-		assert_eq!(pad.property::<Status>("status"), Status::Active);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Active);
 
 		let finished = sink.imp().finish_admission();
 		sink.imp().publish_finished(finished);
-		assert_eq!(pad.property::<Status>("status"), Status::Ended);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Ended);
 		let _ = element.set_state(gst::State::Null);
 	}
 
@@ -1243,7 +1243,7 @@ mod tests {
 		sink.imp().release_pad(&pad);
 
 		let pad = pad.downcast::<MoqSinkPad>().expect("MoqSinkPad");
-		assert_eq!(pad.property::<Status>("status"), Status::Pending);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Pending);
 		assert!(pad.parent().is_none());
 	}
 
@@ -1271,10 +1271,10 @@ mod tests {
 			},
 		]);
 
-		assert_eq!(ended.property::<Status>("status"), Status::Ended);
+		assert_eq!(ended.property::<Status>("track-status"), Status::Ended);
 		assert_eq!(ended.property::<Option<String>>("track-error"), None);
 		assert_eq!(
-			failed.property::<Status>("status"),
+			failed.property::<Status>("track-status"),
 			Status::Error,
 			"a producer that would not close leaves its pad in error, not ended"
 		);

@@ -14,7 +14,7 @@ use super::session::{CAT, CompletionHandle};
 /// What the pad's track is doing, as reported by the `status` property.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[repr(u32)]
-#[enum_type(name = "MoqSinkPadStatus")]
+#[enum_type(name = "GstMoqSinkPadStatus")]
 pub enum Status {
 	/// Requested, with no producer yet: CAPS has not arrived, or the element is not started.
 	#[default]
@@ -185,12 +185,12 @@ impl ObjectImpl for MoqSinkPadImp {
 					.default_value(MediaContainer::Legacy)
 					.mutable_playing()
 					.build(),
-				glib::ParamSpecEnum::builder::<Status>("status")
+				glib::ParamSpecEnum::builder::<Status>("track-status")
 					.nick("Status")
 					.blurb(
 						"What this pad's track is doing: pending until CAPS builds a producer, active \
 						 once the broadcast reserved the track, ended when it was finalized, error when \
-						 the pad was invalidated. A connection drop is the element's status, not this one",
+						 the pad was invalidated. A connection drop is the element's `status`",
 					)
 					.read_only()
 					.build(),
@@ -249,7 +249,7 @@ impl ObjectImpl for MoqSinkPadImp {
 				.or_else(|| lifecycle.settings.requested.clone())
 				.to_value(),
 			"container" => lifecycle.settings.container.to_value(),
-			"status" => lifecycle.settings.status.to_value(),
+			"track-status" => lifecycle.settings.status.to_value(),
 			"track-error" => lifecycle.settings.error.clone().to_value(),
 			_ => unreachable!(),
 		}
@@ -276,7 +276,7 @@ impl MoqSinkPad {
 			self.notify("track");
 		}
 		if changes.status {
-			self.notify("status");
+			self.notify("track-status");
 		}
 		if changes.error {
 			self.notify("track-error");
@@ -314,17 +314,17 @@ mod tests {
 	#[test]
 	fn the_status_follows_the_lifecycle() {
 		let pad = sink_pad();
-		assert_eq!(pad.property::<Status>("status"), Status::Pending);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Pending);
 		assert_eq!(pad.property::<Option<String>>("track-error"), None);
 
 		apply(&pad, |lifecycle| lifecycle.commit("camera".to_string()));
-		assert_eq!(pad.property::<Status>("status"), Status::Active);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Active);
 
 		apply(&pad, PadLifecycle::end);
-		assert_eq!(pad.property::<Status>("status"), Status::Ended);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Ended);
 
 		apply(&pad, |lifecycle| lifecycle.fail("no caps".to_string()));
-		assert_eq!(pad.property::<Status>("status"), Status::Error);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Error);
 		assert_eq!(
 			pad.property::<Option<String>>("track-error").as_deref(),
 			Some("no caps")
@@ -332,7 +332,7 @@ mod tests {
 
 		apply(&pad, PadLifecycle::reset);
 		assert_eq!(
-			pad.property::<Status>("status"),
+			pad.property::<Status>("track-status"),
 			Status::Pending,
 			"a released pad is pending again"
 		);
@@ -349,7 +349,7 @@ mod tests {
 		let pad = sink_pad();
 		apply(&pad, |lifecycle| lifecycle.fail("bad bitstream".to_string()));
 		apply(&pad, PadLifecycle::end);
-		assert_eq!(pad.property::<Status>("status"), Status::Error);
+		assert_eq!(pad.property::<Status>("track-status"), Status::Error);
 		assert_eq!(
 			pad.property::<Option<String>>("track-error").as_deref(),
 			Some("bad bitstream")

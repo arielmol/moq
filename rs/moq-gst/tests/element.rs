@@ -26,7 +26,7 @@ fn child_of(sink: &gst::Element, name: &str) -> gst::glib::Object {
 /// The `status` nick, read the way an application without this crate's types would: through the enum
 /// class rather than by naming the Rust enum.
 fn status_of(sink: &gst::Element, pad: &str) -> String {
-	let value = child_of(sink, pad).property_value("status");
+	let value = child_of(sink, pad).property_value("track-status");
 	let (_, variant) = gst::glib::EnumValue::from_value(&value).expect("status is an enum property");
 	variant.nick().to_string()
 }
@@ -287,7 +287,7 @@ fn an_eos_claimed_while_playing_survives_a_handler_that_pauses() {
 
 	let paused = sink.clone();
 	let transition = pause_succeeded.clone();
-	child_of(&sink, "sink_0").connect_notify(Some("status"), move |_, _| {
+	child_of(&sink, "sink_0").connect_notify(Some("track-status"), move |_, _| {
 		if status_of(&paused, "sink_0") == "ended" {
 			transition.store(
 				paused.set_state(gst::State::Paused) == Ok(gst::StateChangeSuccess::Success),
@@ -1007,7 +1007,7 @@ fn a_pad_requested_from_the_eos_notify_is_refused() {
 	let swap = swapped.clone();
 	let element = sink.clone();
 	let old = second.clone();
-	child_of(&sink, "sink_0").connect_notify(Some("status"), move |_, _| {
+	child_of(&sink, "sink_0").connect_notify(Some("track-status"), move |_, _| {
 		if swap.swap(true, Ordering::SeqCst) {
 			return;
 		}
@@ -1023,7 +1023,7 @@ fn a_pad_requested_from_the_eos_notify_is_refused() {
 	let released = second
 		.downcast_ref::<gst::Pad>()
 		.expect("the released pad is still held");
-	let value = released.property_value("status");
+	let value = released.property_value("track-status");
 	let (_, variant) = gst::glib::EnumValue::from_value(&value).expect("status is an enum property");
 	assert_eq!(
 		variant.nick(),
@@ -1068,7 +1068,7 @@ fn a_rejected_write_moves_the_pad_to_error() {
 	assert_eq!(track_error_of(&sink, "sink_0").as_deref(), Some("frame too large"));
 	let notifies = notifies.lock().unwrap();
 	assert_eq!(
-		notifies.iter().filter(|n| *n == "status").count(),
+		notifies.iter().filter(|n| *n == "track-status").count(),
 		1,
 		"the move to error is announced once"
 	);
@@ -1124,8 +1124,8 @@ fn replacing_the_session_from_eos_notify_discards_the_old_eos() {
 	let restarted = Arc::new(AtomicBool::new(false));
 	let done = restarted.clone();
 	let element = sink.clone();
-	child_of(&sink, "sink_0").connect_notify(Some("status"), move |pad, _| {
-		let value = pad.property_value("status");
+	child_of(&sink, "sink_0").connect_notify(Some("track-status"), move |pad, _| {
+		let value = pad.property_value("track-status");
 		let (_, status) = gst::glib::EnumValue::from_value(&value).expect("status enum");
 		if status.nick() == "ended" && !done.swap(true, Ordering::SeqCst) {
 			element
@@ -1349,7 +1349,7 @@ fn release_leaves_the_pad_inactive_and_detached() {
 	sink.release_request_pad(&pad);
 	assert!(!pad.is_active());
 	assert!(pad.parent().is_none());
-	let value = pad.property_value("status");
+	let value = pad.property_value("track-status");
 	let (_, status) = gst::glib::EnumValue::from_value(&value).expect("status enum");
 	assert_eq!(status.nick(), "pending");
 	let _ = sink.set_state(gst::State::Null);
@@ -1366,7 +1366,7 @@ fn releasing_a_pad_from_its_own_notify_returns() {
 	let done = released.clone();
 	let element = sink.clone();
 	let target = pad.clone();
-	child_of(&sink, "sink_0").connect_notify(Some("status"), move |_, _| {
+	child_of(&sink, "sink_0").connect_notify(Some("track-status"), move |_, _| {
 		if !done.swap(true, Ordering::SeqCst) {
 			element.release_request_pad(&target);
 		}
@@ -1434,8 +1434,8 @@ fn status_notifies_on_each_transition() {
 	let child = child_of(&sink, "sink_0");
 	let seen = Arc::new(Mutex::new(Vec::new()));
 	let recorder = seen.clone();
-	child.connect_notify(Some("status"), move |obj, _| {
-		let value = obj.property_value("status");
+	child.connect_notify(Some("track-status"), move |obj, _| {
+		let value = obj.property_value("track-status");
 		let (_, variant) = gst::glib::EnumValue::from_value(&value).expect("status is an enum property");
 		recorder.lock().unwrap().push(variant.nick().to_string());
 	});
