@@ -171,25 +171,6 @@ fn a_failed_ready_to_paused_rolls_back_the_publication() {
 	let _ = sink.set_state(gst::State::Null);
 }
 
-#[test]
-fn a_failed_paused_to_ready_still_releases_the_publication() {
-	init();
-	let sink = publisher();
-	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
-	let (blocker, enabled) = state_change_blocker(false);
-	sink.add_pad(&blocker).expect("add deactivation blocker");
-	sink.set_state(gst::State::Paused).expect("start the publication");
-
-	assert!(
-		sink.set_state(gst::State::Ready).is_err(),
-		"the parent transition reached the controlled deactivation failure"
-	);
-	assert_pad_has_no_live_publication(&pad);
-
-	enabled.store(false, Ordering::SeqCst);
-	let _ = sink.set_state(gst::State::Null);
-}
-
 // A sink posts EOS only in PLAYING. Reaching it in PAUSED still finalizes the pad; the message waits.
 #[test]
 fn eos_in_paused_finalizes_but_holds_the_message() {
@@ -371,6 +352,142 @@ fn a_pad_requested_after_the_end_is_refused() {
 	let _ = sink.set_state(gst::State::Null);
 }
 
+// A failed parent leaves the element in PAUSED, so the session stays with it. Tearing it down would
+// leave a PAUSED element publishing nothing and no transition left to build a replacement.
+#[test]
+fn a_failed_paused_to_ready_keeps_the_publication() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let (blocker, enabled) = state_change_blocker(false);
+	sink.add_pad(&blocker).expect("add deactivation blocker");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	pad.set_active(true).expect("activate the pad");
+	assert!(send_caps(&pad));
+
+	assert!(
+		sink.set_state(gst::State::Ready).is_err(),
+		"the parent transition reached the controlled deactivation failure"
+	);
+	assert!(
+		pad.property::<Option<String>>("track").is_some(),
+		"the element is still in PAUSED, so its publication is still live"
+	);
+
+	// The retry succeeds and is what releases it.
+	enabled.store(false, Ordering::SeqCst);
+	sink.set_state(gst::State::Ready).expect("the retry completes");
+	assert_eq!(
+		pad.property::<Option<String>>("track"),
+		None,
+		"reaching READY released the reservation"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+// The teardown ordering: the parent is what deactivates the pads and waits for the streaming functions
+// to return, so the publication has to outlive that. Finalizing first lets a chain function still in
+// flight write into a finalized producer. Observed from inside pad deactivation, where a streaming
+// function would be.
+#[test]
+fn the_publication_outlives_pad_deactivation() {
+	init();
+	let sink = publisher();
+	let pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	pad.set_active(true).expect("activate the pad");
+	assert!(send_caps(&pad));
+	let reserved = pad.property::<Option<String>>("track").expect("CAPS reserved a track");
+
+	let seen = Arc::new(Mutex::new(None));
+	let record = seen.clone();
+	let observed = pad.clone();
+	let probe = gst::Pad::builder(gst::PadDirection::Sink)
+		.name("deactivation-probe")
+		.activatemode_function(move |_, _, _, active| {
+			if !active {
+				record
+					.lock()
+					.unwrap()
+					.replace(observed.property::<Option<String>>("track"));
+			}
+			Ok(())
+		})
+		.build();
+	sink.add_pad(&probe).expect("add the probe");
+	probe.set_active(true).expect("activate the probe");
+
+	sink.set_state(gst::State::Ready).expect("tear down");
+	assert_eq!(
+		seen.lock().unwrap().clone().flatten().as_deref(),
+		Some(reserved.as_str()),
+		"the publication was still live while the pads were being deactivated"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+// The flush window: a pad that has begun flushing must stop counting towards EOS right away. Waiting
+// for FLUSH_STOP let pad B's EOS complete the element mid-flush, and the finalize that follows is not
+// something pad A's FLUSH_STOP can undo.
+#[test]
+fn an_eos_during_another_pads_flush_does_not_complete_the_element() {
+	init();
+	let sink = publisher();
+	let first = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let second = sink.request_pad_simple("sink_1").expect("request sink_1");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	let bus = recording_bus(&sink);
+
+	assert!(first.send_event(gst::event::Eos::new()));
+	assert!(first.send_event(gst::event::FlushStart::new()));
+	assert!(second.send_event(gst::event::Eos::new()));
+
+	assert_eq!(
+		posted_eos(&bus),
+		0,
+		"the flushing pad is not ended, so the element has not completed"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+// A flush re-anchors the pad's timeline and it flows again, so it must stop counting towards the
+// element's EOS aggregation. Leaving it ended let the *next* pad's EOS complete the element while this
+// one was still publishing.
+#[test]
+fn a_flush_after_eos_makes_the_pad_flow_again() {
+	init();
+	let sink = publisher();
+	let first = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let second = sink.request_pad_simple("sink_1").expect("request sink_1");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	let bus = recording_bus(&sink);
+
+	assert!(first.send_event(gst::event::Eos::new()));
+	assert!(first.send_event(gst::event::FlushStart::new()));
+	assert!(first.send_event(gst::event::FlushStop::builder(true).build()));
+	assert!(second.send_event(gst::event::Eos::new()));
+
+	assert_eq!(
+		posted_eos(&bus),
+		0,
+		"the flushed pad is publishing again, so the element has not ended"
+	);
+	let _ = sink.set_state(gst::State::Null);
+}
+// STREAM_START is the same fresh start.
+#[test]
+fn a_new_stream_after_eos_makes_the_pad_flow_again() {
+	init();
+	let sink = publisher();
+	let first = sink.request_pad_simple("sink_0").expect("request sink_0");
+	let second = sink.request_pad_simple("sink_1").expect("request sink_1");
+	sink.set_state(gst::State::Paused).expect("start the publication");
+	let bus = recording_bus(&sink);
+
+	assert!(first.send_event(gst::event::Eos::new()));
+	assert!(first.send_event(gst::event::StreamStart::new("second-stream")));
+	assert!(second.send_event(gst::event::Eos::new()));
+
+	assert_eq!(posted_eos(&bus), 0, "the restarted pad has not ended");
+	let _ = sink.set_state(gst::State::Null);
+}
 // Request pads appear and disappear through the real GObject boundary, with no session attached.
 #[test]
 fn request_and_release_sink_pads() {

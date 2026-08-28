@@ -508,13 +508,15 @@ impl ElementImpl for MoqSink {
 				result
 			}
 			// The parent goes first so it deactivates the pads and waits for the streaming functions to
-			// return before the session they write into is torn down. Cleanup is unconditional: a failed
-			// downward transition still leaves nothing that would ever release the publication.
+			// return before the session they write into is torn down. A failed parent leaves the element
+			// in PAUSED rather than committing the transition, so the session stays with it: tearing down
+			// anyway would leave a PAUSED element publishing nothing, with no transition left to build a
+			// replacement. The retry cleans up.
 			gst::StateChange::PausedToReady => {
-				let result = self.parent_change_state(transition);
+				let success = self.parent_change_state(transition)?;
 				self.leave_playing();
 				self.stop_session();
-				result
+				Ok(success)
 			}
 			_ => self.parent_change_state(transition),
 		}
@@ -784,6 +786,20 @@ impl MoqSink {
 				self.publish_finished(finished);
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
+			// A pad that starts flushing stops counting towards EOS immediately, not when the flush
+			// finishes. Waiting for FLUSH_STOP lets another pad's EOS complete the element inside the
+			// flush window, and the finalize that follows is not something FLUSH_STOP can undo.
+			gst::EventView::FlushStart(_) => {
+				let control = self.control.lock().unwrap();
+				if control.live.as_ref().is_some_and(|state| state.is_open()) {
+					let mut lifecycle = sink_pad.lifecycle();
+					if !lifecycle.releasing {
+						lifecycle.ended = false;
+					}
+				}
+				drop(control);
+				gst::Pad::event_default(pad, Some(&*self.obj()), event)
+			}
 			gst::EventView::FlushStop(_) => {
 				let control = self.control.lock().unwrap();
 				if control.live.as_ref().is_some_and(|state| state.is_open()) {
@@ -796,12 +812,17 @@ impl MoqSink {
 				drop(control);
 				gst::Pad::event_default(pad, Some(&*self.obj()), event)
 			}
+			// A new stream on this pad is a fresh start: it no longer counts as ended, and its timeline is
+			// re-anchored like a flush. Without that the old stream's segment base stays current, and a
+			// new stream restarting at zero reads as a rewind, which invalidates the pad and silently
+			// drops its buffers.
 			gst::EventView::StreamStart(_) => {
 				let control = self.control.lock().unwrap();
 				if control.live.as_ref().is_some_and(|state| state.is_open()) {
 					let mut lifecycle = sink_pad.lifecycle();
 					if !lifecycle.releasing {
 						lifecycle.ended = false;
+						lifecycle.media.flush();
 					}
 				}
 				drop(control);
