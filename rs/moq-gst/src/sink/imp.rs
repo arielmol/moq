@@ -503,12 +503,13 @@ impl ElementImpl for MoqSink {
 				self.enter_playing();
 				Ok(success)
 			}
-			// Fail-closed like the transition below it: a failed parent still left PLAYING, and a gate
-			// held open would let the next EOS out as if the element were still playing.
+			// Symmetric with the transition below: a failed parent is not committed, so the element is
+			// still PLAYING and the gate stays open. Closing it anyway would strand an EOS earned
+			// afterwards, because no later entry to PLAYING would come along to claim it.
 			gst::StateChange::PlayingToPaused => {
-				let result = self.parent_change_state(transition);
+				let success = self.parent_change_state(transition)?;
 				self.leave_playing();
-				result
+				Ok(success)
 			}
 			// The parent goes first so it deactivates the pads and waits for the streaming functions to
 			// return before the session they write into is torn down. A failed parent leaves the element

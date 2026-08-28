@@ -11,7 +11,7 @@ use super::MediaContainer;
 use super::pad::Pad;
 use super::session::{CAT, CompletionHandle};
 
-/// What the pad's track is doing, as reported by the `status` property.
+/// What the pad's track is doing, as reported by the `track-status` property.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[repr(u32)]
 #[enum_type(name = "GstMoqSinkPadStatus")]
@@ -119,10 +119,11 @@ impl PadLifecycle {
 		}
 	}
 
-	/// Record a terminal failure without changing an earlier failure's EOS semantics.
+	/// Record a terminal failure. The first reason wins: `error` is terminal for the run, so a later
+	/// failure on an already-failed pad must not rewrite why it stopped. Cleared by [`Self::reset`].
 	pub(super) fn fail(&mut self, reason: String) -> Notifications {
-		let error = self.settings.error.as_deref() != Some(reason.as_str());
-		self.settings.error = Some(reason);
+		let error = self.settings.error.is_none();
+		self.settings.error.get_or_insert(reason);
 		Notifications {
 			status: self.settings.set_status(Status::Error),
 			error,
@@ -340,6 +341,31 @@ mod tests {
 			pad.property::<Option<String>>("track-error"),
 			None,
 			"and carries no stale reason"
+		);
+	}
+
+	// `error` is terminal for the run, so the reason the pad actually stopped has to survive a later
+	// failure. A pad that fails on its bitstream and then sees an unsupported caps event still reports
+	// the bitstream.
+	#[test]
+	fn the_first_failure_reason_wins() {
+		let pad = sink_pad();
+		apply(&pad, |lifecycle| lifecycle.fail("aac without codec_data".to_string()));
+		apply(&pad, |lifecycle| {
+			lifecycle.fail("unsupported caps: video/x-raw".to_string())
+		});
+		assert_eq!(
+			pad.property::<Option<String>>("track-error").as_deref(),
+			Some("aac without codec_data"),
+			"the later failure did not rewrite why the pad stopped"
+		);
+
+		apply(&pad, PadLifecycle::reset);
+		apply(&pad, |lifecycle| lifecycle.fail("a new run's failure".to_string()));
+		assert_eq!(
+			pad.property::<Option<String>>("track-error").as_deref(),
+			Some("a new run's failure"),
+			"but a reset clears it for the next run"
 		);
 	}
 
